@@ -235,33 +235,36 @@ __global__ void __launch_bounds__(256) k45_pipe(const half* A, const half* W, ha
         }
 }
 
-// ------------------------------------------ v7: 256x128 block tile, 64x64 warp tile
-// cuBLAS picks a 256x128 tile here; v6's 128x128 leaves its warps doing 16 mma
-// per k-step for every 8 ldmatrix. With a 64x64 warp tile it is 32 mma per 12
-// ldmatrix, so more math per shared-memory byte. 8 warps as 4 (M) x 2 (N).
-// 3 stages x (16 KB A + 8 KB W) = 72 KB > the 48 KB static limit: dynamic smem.
-// Keeps v5's swizzle and v6's rasterization.
-constexpr int BM7 = 256, BN7 = 128, BK7 = 32;
-constexpr int SMEM7 = STAGES * (BM7 + BN7) * BK7 * 2;
+// ------------------------------------- v7/v9: big block tiles, 64x64 warp tiles
+// v7 = 256x128, v9 = 128x256. A 64x64 warp tile does 32 mma per 12 ldmatrix
+// (v6: 16 per 8), so more math per shared-memory byte. 8 warps, laid out as
+// (BM/64) x (BN/64). 3 stages x (BM + BN) x 32 x 2 B = 72 KB: dynamic smem.
+// Which orientation wins depends on the shape: DRAM traffic is about
+// |A| * N/BN + |W| * M/BM (the operand that doesn't fit in L2 is re-read once
+// per tile column), so a wide-N GEMM wants BN = 256. Swizzle + rasterization kept.
+constexpr int BK7 = 32;
+template <int BM, int BN> constexpr int smem_big() { return STAGES * (BM + BN) * BK7 * 2; }
+template <int BM, int BN>
 __global__ void __launch_bounds__(256) k7_big(const half* A, const half* W, half* C, int M, int N, int K) {
+    constexpr int WN_WARPS = BN / 64;                        // warps along N
     extern __shared__ __align__(128) half sm[];
-    auto As = [&](int st, int row, int col) -> half* { return &sm[(st * BM7 + row) * BK7 + col]; };
-    auto Ws = [&](int st, int row, int col) -> half* { return &sm[STAGES * BM7 * BK7 + (st * BN7 + row) * BK7 + col]; };
+    auto As = [&](int st, int row, int col) -> half* { return &sm[(st * BM + row) * BK7 + col]; };
+    auto Ws = [&](int st, int row, int col) -> half* { return &sm[STAGES * BM * BK7 + (st * BN + row) * BK7 + col]; };
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    int wm = warp / 2, wn = warp % 2;                        // warp tile origin: (wm*64, wn*64)
-    int pid = blockIdx.x, grid_m = M / BM7, grid_n = N / BN7;
+    int wm = warp / WN_WARPS, wn = warp % WN_WARPS;          // warp tile origin: (wm*64, wn*64)
+    int pid = blockIdx.x, grid_m = M / BM, grid_n = N / BN;
     int group = pid / (GROUP_M * grid_n), first_m = group * GROUP_M;
     int gm = min(grid_m - first_m, GROUP_M), in_group = pid % (GROUP_M * grid_n);
-    int m0 = (first_m + in_group % gm) * BM7, n0 = (in_group / gm) * BN7;
+    int m0 = (first_m + in_group % gm) * BM, n0 = (in_group / gm) * BN;
     int KT = K / BK7;
     auto load = [&](int st, int kt) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {                        // A: 256 rows x 4 chunks
+        for (int i = 0; i < BM / 64; ++i) {                  // BM rows x 4 chunks over 256 threads
             int idx = tid + i * 256, row = idx >> 2, ch = idx & 3;
             cp_async16(smem_u32(As(st, row, swz<true>(row, ch) * 8)), &A[(size_t)(m0 + row) * K + kt * BK7 + ch * 8]);
         }
 #pragma unroll
-        for (int i = 0; i < 2; ++i) {                        // W: 128 rows x 4 chunks
+        for (int i = 0; i < BN / 64; ++i) {
             int idx = tid + i * 256, row = idx >> 2, ch = idx & 3;
             cp_async16(smem_u32(Ws(st, row, swz<true>(row, ch) * 8)), &W[(size_t)(n0 + row) * K + kt * BK7 + ch * 8]);
         }
