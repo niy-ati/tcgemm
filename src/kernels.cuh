@@ -244,8 +244,11 @@ __global__ void __launch_bounds__(256) k45_pipe(const half* A, const half* W, ha
 // per tile column), so a wide-N GEMM wants BN = 256. Swizzle + rasterization kept.
 constexpr int BK7 = 32;
 template <int BM, int BN> constexpr int smem_big() { return STAGES * (BM + BN) * BK7 * 2; }
-template <int BM, int BN>
-__global__ void __launch_bounds__(256) k7_big(const half* A, const half* W, half* C, int M, int N, int K) {
+// EPI = true fuses y = SiLU(acc + bias[n]) + residual[m, n] into the store, in fp32,
+// so C is written once instead of being re-read by follow-up elementwise kernels.
+template <int BM, int BN, bool EPI = false>
+__global__ void __launch_bounds__(256) k7_big(const half* A, const half* W, half* C, int M, int N, int K,
+                                              const half* bias = nullptr, const half* R = nullptr) {
     constexpr int WN_WARPS = BN / 64;                        // warps along N
     extern __shared__ __align__(128) half sm[];
     auto As = [&](int st, int row, int col) -> half* { return &sm[(st * BM + row) * BK7 + col]; };
@@ -306,8 +309,18 @@ __global__ void __launch_bounds__(256) k7_big(const half* A, const half* W, half
 #pragma unroll
         for (int ni = 0; ni < 8; ++ni) {
             int r = m0 + wm * 64 + mi * 16 + (lane >> 2), c = n0 + wn * 64 + ni * 8 + (lane & 3) * 2;
-            *reinterpret_cast<half2*>(&C[(size_t)r * N + c]) = __floats2half2_rn(acc[mi][ni][0], acc[mi][ni][1]);
-            *reinterpret_cast<half2*>(&C[(size_t)(r + 8) * N + c]) = __floats2half2_rn(acc[mi][ni][2], acc[mi][ni][3]);
+            float* v = acc[mi][ni];
+            if (EPI) {
+                float2 b = __half22float2(*reinterpret_cast<const half2*>(&bias[c]));
+                float2 r0 = __half22float2(*reinterpret_cast<const half2*>(&R[(size_t)r * N + c]));
+                float2 r1 = __half22float2(*reinterpret_cast<const half2*>(&R[(size_t)(r + 8) * N + c]));
+                float t[4] = {v[0] + b.x, v[1] + b.y, v[2] + b.x, v[3] + b.y};
+#pragma unroll
+                for (int q = 0; q < 4; ++q) t[q] = t[q] / (1.f + __expf(-t[q]));   // SiLU
+                v[0] = t[0] + r0.x; v[1] = t[1] + r0.y; v[2] = t[2] + r1.x; v[3] = t[3] + r1.y;
+            }
+            *reinterpret_cast<half2*>(&C[(size_t)r * N + c]) = __floats2half2_rn(v[0], v[1]);
+            *reinterpret_cast<half2*>(&C[(size_t)(r + 8) * N + c]) = __floats2half2_rn(v[2], v[3]);
         }
 }
 
@@ -444,4 +457,131 @@ __global__ void __launch_bounds__(128) k11_splitk(const half* A, const half* W, 
         if (r < M) { atomicAdd(&Cf[(size_t)r * N + c], acc[ni][0]); atomicAdd(&Cf[(size_t)r * N + c + 1], acc[ni][1]); }
         if (r + 8 < M) { atomicAdd(&Cf[(size_t)(r + 8) * N + c], acc[ni][2]); atomicAdd(&Cf[(size_t)(r + 8) * N + c + 1], acc[ni][3]); }
     }
+}
+
+// ------------------------------------------------ unfused epilogue baselines
+// eager: three kernels, each a full pass over C (bias add, SiLU, residual add).
+__global__ void ew_bias(half* C, const half* bias, int M, int N) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (size_t)M * N) C[i] = __float2half(__half2float(C[i]) + __half2float(bias[i % N]));
+}
+__global__ void ew_silu(half* C, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { float x = __half2float(C[i]); C[i] = __float2half(x / (1.f + __expf(-x))); }
+}
+__global__ void ew_residual(half* C, const half* R, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) C[i] = __float2half(__half2float(C[i]) + __half2float(R[i]));
+}
+// best unfused: one elementwise kernel doing all three, half2-vectorized
+__global__ void ew_fused(half* C, const half* bias, const half* R, int M, int N) {
+    size_t i = 2 * ((size_t)blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= (size_t)M * N) return;
+    float2 c = __half22float2(*reinterpret_cast<half2*>(&C[i]));
+    float2 b = __half22float2(*reinterpret_cast<const half2*>(&bias[i % N]));
+    float2 r = __half22float2(*reinterpret_cast<const half2*>(&R[i]));
+    float x0 = c.x + b.x, x1 = c.y + b.y;
+    x0 = x0 / (1.f + __expf(-x0)) + r.x;
+    x1 = x1 / (1.f + __expf(-x1)) + r.y;
+    *reinterpret_cast<half2*>(&C[i]) = __floats2half2_rn(x0, x1);
+}
+
+// ------------------------------------- v12: any-layout GEMM for the backward pass
+// C[M,N] = sum_k opA[m,k] * opB[n,k], with each operand stored either reduction-
+// contiguous (as in the forward pass) or output-contiguous:
+//   TA = false: A[m*K + k]      TA = true: A[k*M + m]
+//   TB = false: B[n*K + k]      TB = true: B[k*N + n]
+// Linear backward:  dX = dY . W     -> TA = false, TB = true
+//                   dW = dY^T . X   -> TA = true,  TB = true
+// Output-contiguous tiles are staged as they lie in memory ([BK][128], 256-byte
+// rows) and transposed on the way into registers by ldmatrix.trans, so no operand
+// is ever transposed in memory. Those rows hold 16 chunks; swizzle chunk ^ (k & 7)
+// keeps the 8 rows an ldmatrix reads on distinct banks.
+// 128x128x32 tile, 8 warps as 2 x 4 (64x32 warp tiles), cp.async 3-stage, rasterized.
+__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+template <bool TA, bool TB>
+__global__ void __launch_bounds__(256) k12_any(const half* A, const half* B, half* C, int M, int N, int K) {
+    __shared__ __align__(128) half sA[STAGES][128 * 32], sB[STAGES][128 * 32];
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    int wm = warp / 4, wn = warp % 4;
+    int pid = blockIdx.x, grid_m = M / 128, grid_n = N / 128;
+    int group = pid / (GROUP_M * grid_n), first_m = group * GROUP_M;
+    int gm = min(grid_m - first_m, GROUP_M), in_group = pid % (GROUP_M * grid_n);
+    int m0 = (first_m + in_group % gm) * 128, n0 = (in_group / gm) * 128;
+    int KT = K / 32;
+    auto load = [&](int st, int kt) {
+        int k0 = kt * 32;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            int idx = tid + i * 256;
+            if (!TA) {   // 128 rows (m) x 4 chunks (k)
+                int row = idx >> 2, ch = idx & 3;
+                cp_async16(smem_u32(&sA[st][row * 32 + swz<true>(row, ch) * 8]), &A[(size_t)(m0 + row) * K + k0 + ch * 8]);
+            } else {     // 32 rows (k) x 16 chunks (m)
+                int row = idx >> 4, ch = idx & 15;
+                cp_async16(smem_u32(&sA[st][row * 128 + (ch ^ (row & 7)) * 8]), &A[(size_t)(k0 + row) * M + m0 + ch * 8]);
+            }
+            if (!TB) {
+                int row = idx >> 2, ch = idx & 3;
+                cp_async16(smem_u32(&sB[st][row * 32 + swz<true>(row, ch) * 8]), &B[(size_t)(n0 + row) * K + k0 + ch * 8]);
+            } else {
+                int row = idx >> 4, ch = idx & 15;
+                cp_async16(smem_u32(&sB[st][row * 128 + (ch ^ (row & 7)) * 8]), &B[(size_t)(k0 + row) * N + n0 + ch * 8]);
+            }
+        }
+    };
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < KT) load(s, s);
+        cp_async_commit();
+    }
+    float acc[4][4][4] = {};
+    int j = lane >> 3, i8 = lane & 7;   // which of the four 8x8 matrices this lane addresses, and its row
+    for (int kt = 0; kt < KT; ++kt) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        if (kt + STAGES - 1 < KT) load((kt + STAGES - 1) % STAGES, kt + STAGES - 1);
+        cp_async_commit();
+        int st = kt % STAGES;
+#pragma unroll
+        for (int kk = 0; kk < 32; kk += 16) {
+            uint32_t a[4][4], b[4][2];
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi) {
+                if (!TA) {
+                    int row = wm * 64 + mi * 16 + (lane & 15), ch = (kk >> 3) + (lane >> 4);
+                    ldmatrix_x4(a[mi][0], a[mi][1], a[mi][2], a[mi][3], smem_u32(&sA[st][row * 32 + swz<true>(row, ch) * 8]));
+                } else {   // matrices: (m 0-7,k 0-7) (m 8-15,k 0-7) (m 0-7,k 8-15) (m 8-15,k 8-15)
+                    int k = kk + (j >> 1) * 8 + i8, m = wm * 64 + mi * 16 + (j & 1) * 8;
+                    ldmatrix_x4_trans(a[mi][0], a[mi][1], a[mi][2], a[mi][3], smem_u32(&sA[st][k * 128 + ((m >> 3) ^ (k & 7)) * 8]));
+                }
+            }
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                if (!TB) {
+                    int row = wn * 32 + p * 16 + (lane & 7) + (lane >> 4) * 8, ch = (kk >> 3) + ((lane >> 3) & 1);
+                    ldmatrix_x4(b[2 * p][0], b[2 * p][1], b[2 * p + 1][0], b[2 * p + 1][1], smem_u32(&sB[st][row * 32 + swz<true>(row, ch) * 8]));
+                } else {   // matrices: (n 0-7,k 0-7) (n 0-7,k 8-15) (n 8-15,k 0-7) (n 8-15,k 8-15)
+                    int k = kk + (j & 1) * 8 + i8, n = wn * 32 + p * 16 + (j >> 1) * 8;
+                    ldmatrix_x4_trans(b[2 * p][0], b[2 * p][1], b[2 * p + 1][0], b[2 * p + 1][1], smem_u32(&sB[st][k * 128 + ((n >> 3) ^ (k & 7)) * 8]));
+                }
+            }
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < 4; ++ni) mma_16816(acc[mi][ni], a[mi], b[ni]);
+        }
+    }
+    cp_async_wait<0>();
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+            int r = m0 + wm * 64 + mi * 16 + (lane >> 2), c = n0 + wn * 32 + ni * 8 + (lane & 3) * 2;
+            *reinterpret_cast<half2*>(&C[(size_t)r * N + c]) = __floats2half2_rn(acc[mi][ni][0], acc[mi][ni][1]);
+            *reinterpret_cast<half2*>(&C[(size_t)(r + 8) * N + c]) = __floats2half2_rn(acc[mi][ni][2], acc[mi][ni][3]);
+        }
 }

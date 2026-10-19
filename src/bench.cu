@@ -249,6 +249,144 @@ static float time_ms(const std::function<void()>& f, void* flush, size_t flush_b
     return t[t.size() / 2];
 }
 
+// EPI=1 ./bench : y = SiLU(A W^T + bias) + residual, three ways, on the prefill shapes.
+// Reference: fp32 host computation from the fp16 GEMM result of cuBLAS (the GEMM
+// itself was validated above); the fused kernel keeps the pre-epilogue value in
+// fp32, so it differs from the unfused paths by at most one fp16 rounding.
+static void epilogue_bench(void* flush, size_t flush_bytes) {
+    struct S { int M, N, K; const char* name; };
+    std::vector<S> shapes = {{2048, 14336, 4096, "llama8b_up_proj_m2048"}, {2048, 4096, 14336, "llama8b_down_proj_m2048"},
+                             {2048, 4096, 4096, "llama8b_o_proj_m2048"}};
+    std::mt19937 rng(1);
+    std::uniform_real_distribution<float> U(-1.f, 1.f);
+    for (const S& sh : shapes) {
+        int M = sh.M, N = sh.N, K = sh.K;
+        size_t nC = (size_t)M * N;
+        std::vector<half> hA((size_t)M * K), hW((size_t)N * K), hb(N), hR(nC);
+        for (auto& v : hA) v = __float2half(U(rng));
+        for (auto& v : hW) v = __float2half(U(rng));
+        for (auto& v : hb) v = __float2half(U(rng));
+        for (auto& v : hR) v = __float2half(U(rng));
+        half *A, *W, *b, *R, *C;
+        CK(cudaMalloc(&A, hA.size() * 2)); CK(cudaMalloc(&W, hW.size() * 2)); CK(cudaMalloc(&b, N * 2));
+        CK(cudaMalloc(&R, nC * 2)); CK(cudaMalloc(&C, nC * 2));
+        CK(cudaMemcpy(A, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(W, hW.data(), hW.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(b, hb.data(), N * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(R, hR.data(), nC * 2, cudaMemcpyHostToDevice));
+        int g1 = (int)((nC + 255) / 256), g2 = (int)((nC / 2 + 255) / 256);
+        auto eager = [&] { cublas_gemm(A, W, C, M, N, K); ew_bias<<<g1, 256>>>(C, b, M, N); ew_silu<<<g1, 256>>>(C, nC); ew_residual<<<g1, 256>>>(C, R, nC); };
+        auto unfused = [&] { cublas_gemm(A, W, C, M, N, K); ew_fused<<<g2, 256>>>(C, b, R, M, N); };
+        auto fused = [&] {
+            constexpr int smem = smem_big<128, 256>();
+            static bool attr = (cudaFuncSetAttribute(k7_big<128, 256, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), true);
+            (void)attr;
+            k7_big<128, 256, true><<<(N / 256) * (M / 128), 256, smem>>>(A, W, C, M, N, K, b, R);
+        };
+        // reference from cuBLAS GEMM output
+        cublas_gemm(A, W, C, M, N, K);
+        CK(cudaDeviceSynchronize());
+        std::vector<half> hG(nC), hC(nC);
+        CK(cudaMemcpy(hG.data(), C, nC * 2, cudaMemcpyDeviceToHost));
+        std::vector<float> ref(nC);
+        for (size_t i = 0; i < nC; ++i) {
+            float x = __half2float(hG[i]) + __half2float(hb[i % N]);
+            ref[i] = x / (1.f + std::exp(-x)) + __half2float(hR[i]);
+        }
+        // v9 GEMM followed by the separate elementwise kernel: same GEMM as the fused
+        // version, so fused vs this isolates what fusion itself saves.
+        auto v9_unfused = [&] { launch_v9(A, W, C, M, N, K); ew_fused<<<g2, 256>>>(C, b, R, M, N); };
+        const char* names[4] = {"cublas+3_kernels", "cublas+1_fused_kernel", "v9+1_fused_kernel", "v9_fused_epilogue"};
+        std::function<void()> fns[4] = {eager, unfused, v9_unfused, fused};
+        float base_ms = 0;
+        for (int k = 0; k < 4; ++k) {
+            fns[k]();
+            CK(cudaGetLastError());
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemcpy(hC.data(), C, nC * 2, cudaMemcpyDeviceToHost));
+            size_t bad = 0;
+            double max_err = 0;
+            for (size_t i = 0; i < nC; ++i) {
+                double d = std::fabs(__half2float(hC[i]) - ref[i]);
+                if (!(d <= 0.05 + 1e-2 * std::fabs(ref[i]))) ++bad;
+                max_err = std::max(max_err, d);
+            }
+            for (int w = 0; w < 3; ++w) fns[k]();
+            float ms = time_ms(fns[k], flush, flush_bytes, 20);
+            if (k == 0) base_ms = ms;
+            printf("{\"mode\":\"epilogue\",\"kernel\":\"%s\",\"shape\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"ms\":%.4f,"
+                   "\"speedup_vs_eager\":%.3f,\"max_abs_err\":%.4g,\"bad\":%zu,\"correct\":%s}\n",
+                   names[k], sh.name, M, N, K, ms, base_ms / ms, max_err, bad, bad == 0 ? "true" : "false");
+            fflush(stdout);
+        }
+        CK(cudaFree(A)); CK(cudaFree(W)); CK(cudaFree(b)); CK(cudaFree(R)); CK(cudaFree(C));
+    }
+}
+
+// BWD=1 ./bench : the two backward GEMMs of a Linear layer y = x W^T, vs cuBLAS.
+//   dX[M,Kf] = dY[M,N] . W[N,Kf]        dW[N,Kf] = dY^T[N,M] . X[M,Kf]
+// cuBLAS (column-major view of row-major buffers):
+//   dX: gemm(N, N, m=Kf, n=M, k=N, W lda=Kf, dY ldb=N, dX ldc=Kf)
+//   dW: gemm(N, T, m=Kf, n=N, k=M, X lda=Kf, dY ldb=N, dW ldc=Kf)
+static void backward_bench(void* flush, size_t flush_bytes) {
+    struct L { int M, N, Kf; const char* name; };
+    std::vector<L> layers = {{2048, 4096, 4096, "llama8b_o_proj_t2048"}, {2048, 14336, 4096, "llama8b_up_proj_t2048"},
+                             {2048, 4096, 14336, "llama8b_down_proj_t2048"}};
+    std::mt19937 rng(2);
+    std::uniform_real_distribution<float> U(-1.f, 1.f);
+    for (const L& L_ : layers) {
+        int M = L_.M, N = L_.N, Kf = L_.Kf;
+        std::vector<half> hX((size_t)M * Kf), hW((size_t)N * Kf), hdY((size_t)M * N);
+        for (auto& v : hX) v = __float2half(U(rng));
+        for (auto& v : hW) v = __float2half(U(rng));
+        for (auto& v : hdY) v = __float2half(U(rng));
+        half *X, *W, *dY, *out, *ref;
+        size_t big = std::max((size_t)M * Kf, (size_t)N * Kf);
+        CK(cudaMalloc(&X, hX.size() * 2)); CK(cudaMalloc(&W, hW.size() * 2)); CK(cudaMalloc(&dY, hdY.size() * 2));
+        CK(cudaMalloc(&out, big * 2)); CK(cudaMalloc(&ref, big * 2));
+        CK(cudaMemcpy(X, hX.data(), hX.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(W, hW.data(), hW.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dY, hdY.data(), hdY.size() * 2, cudaMemcpyHostToDevice));
+        float alpha = 1.f, beta = 0.f;
+        struct G { const char* name; int m, n, k; std::function<void(half*)> blas, ours; };
+        std::vector<G> gs = {
+            {"dX", M, Kf, N,
+             [&](half* o) { CB(cublasGemmEx(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, Kf, M, N, &alpha, W, CUDA_R_16F, Kf, dY, CUDA_R_16F, N, &beta, o, CUDA_R_16F, Kf, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT)); },
+             [&](half* o) { k12_any<false, true><<<(M / 128) * (Kf / 128), 256>>>(dY, W, o, M, Kf, N); }},
+            {"dW", N, Kf, M,
+             [&](half* o) { CB(cublasGemmEx(g_blas, CUBLAS_OP_N, CUBLAS_OP_T, Kf, N, M, &alpha, X, CUDA_R_16F, Kf, dY, CUDA_R_16F, N, &beta, o, CUDA_R_16F, Kf, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT)); },
+             [&](half* o) { k12_any<true, true><<<(N / 128) * (Kf / 128), 256>>>(dY, X, o, N, Kf, M); }},
+        };
+        for (G& g : gs) {
+            size_t n = (size_t)g.m * g.n;
+            g.blas(ref);
+            g.ours(out);
+            CK(cudaGetLastError());
+            CK(cudaDeviceSynchronize());
+            std::vector<half> hr(n), ho(n);
+            CK(cudaMemcpy(hr.data(), ref, n * 2, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(ho.data(), out, n * 2, cudaMemcpyDeviceToHost));
+            size_t bad = 0;
+            double max_err = 0;
+            for (size_t i = 0; i < n; ++i) {
+                double r = __half2float(hr[i]), c = __half2float(ho[i]), d = std::fabs(c - r);
+                if (!(d <= 0.05 + 1e-2 * std::fabs(r))) ++bad;
+                max_err = std::max(max_err, std::isnan(d) ? INFINITY : d);
+            }
+            for (int w = 0; w < 3; ++w) { g.blas(ref); g.ours(out); }
+            float tb = time_ms([&] { g.blas(ref); }, flush, flush_bytes, 15);
+            float to = time_ms([&] { g.ours(out); }, flush, flush_bytes, 15);
+            double fl = 2.0 * g.m * g.n * g.k;
+            printf("{\"mode\":\"backward\",\"gemm\":\"%s\",\"layer\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"cublas_tflops\":%.3f,"
+                   "\"ours_tflops\":%.3f,\"pct_cublas\":%.1f,\"max_abs_err\":%.4g,\"bad\":%zu,\"correct\":%s}\n",
+                   g.name, L_.name, g.m, g.n, g.k, fl / tb / 1e9, fl / to / 1e9, 100.0 * tb / to, max_err, bad,
+                   bad == 0 ? "true" : "false");
+            fflush(stdout);
+        }
+        CK(cudaFree(X)); CK(cudaFree(W)); CK(cudaFree(dY)); CK(cudaFree(out)); CK(cudaFree(ref));
+    }
+}
+
 int main(int argc, char** argv) {
     std::vector<std::string> want(argv + 1, argv + argc);
     // Square plus LLM shapes: Qwen3-8B / Llama-3-8B attention-out and MLP projections at prefill M.
@@ -270,6 +408,8 @@ int main(int argc, char** argv) {
     CB(cublasCreate(&g_blas));
     CB(cublasLtCreate(&g_lt));
     fprintf(stderr, "GPU %s, SMs %d, L2 %d KB\n", prop.name, prop.multiProcessorCount, prop.l2CacheSize / 1024);
+    if (getenv("EPI")) { epilogue_bench(flush, flush_bytes); return 0; }
+    if (getenv("BWD")) { backward_bench(flush, flush_bytes); return 0; }
 
     std::mt19937 rng(0);
     std::uniform_real_distribution<float> U(-1.f, 1.f);
