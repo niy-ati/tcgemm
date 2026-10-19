@@ -585,3 +585,95 @@ __global__ void __launch_bounds__(256) k12_any(const half* A, const half* B, hal
             *reinterpret_cast<half2*>(&C[(size_t)(r + 8) * N + c]) = __floats2half2_rn(acc[mi][ni][2], acc[mi][ni][3]);
         }
 }
+
+// ------------------------------------- v13: FP4 (E2M1) weights, fp16 activations, decode
+// sm_86 has no FP4 tensor-core instruction, so this is the weight-only path: W is
+// stored as packed E2M1 (two codes per byte, low nibble = even k) with one fp16 scale
+// per 32 consecutive k, and is dequantized to fp16 in registers right before the
+// usual m16n8k16 fp16 mma. Decode is DRAM-bound, so the point is 4x fewer weight bytes.
+//
+// E2M1 -> fp16 without a table: put the 3 magnitude bits at fp16 bits 11..9 and the
+// sign at bit 15. That fp16 equals the E2M1 value times 2^-14 exactly (code 1 lands
+// on the fp16 subnormal 2^-15), so one multiply by (scale * 2^14) finishes it.
+//
+// Tile: 16 x 128 x 256 per stage. 256 k of FP4 is 128 bytes per W row, the same
+// 128-byte row reads that made v11 fast. W rows are 8 chunks of 16 B, swizzled
+// chunk ^ (row & 7) so the 8 rows a B fragment touches sit on distinct banks.
+constexpr int BK13 = 256;
+constexpr int A13 = 16 * BK13 * 2, W13 = BN10 * BK13 / 2, S13 = BN10 * (BK13 / 32) * 2;
+constexpr int STAGE13 = A13 + W13 + S13, SMEM13 = STAGES * STAGE13;
+__device__ __forceinline__ uint32_t e2m1x2_to_half2(uint32_t v) {
+    return ((v & 0x7u) << 9) | ((v & 0x8u) << 12) | ((v & 0x70u) << 21) | ((v & 0x80u) << 24);
+}
+__global__ void __launch_bounds__(128) k13_fp4(const half* A, const uint8_t* Wq, const half* Ws, float* Cf, int M, int N, int K,
+                                               int k_per_split) {
+    extern __shared__ __align__(128) uint8_t sm13[];
+    auto As = [&](int st) { return reinterpret_cast<half*>(sm13 + st * STAGE13); };
+    auto Wb = [&](int st) { return sm13 + st * STAGE13 + A13; };
+    auto Sc = [&](int st) { return reinterpret_cast<half*>(sm13 + st * STAGE13 + A13 + W13); };
+    int tid = threadIdx.x, lane = tid & 31, wn = tid >> 5;
+    int n0 = blockIdx.x * BN10, kbeg = blockIdx.y * k_per_split;
+    int KT = k_per_split / BK13, G = K / 32;
+    auto load = [&](int st, int kt) {
+        int k = kbeg + kt * BK13;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {                        // A: 16 rows x 32 chunks
+            int idx = tid + i * 128, row = idx >> 5, ch = idx & 31;
+            bool ok = row < M;
+            cp_async16_zfill(smem_u32(&As(st)[row * BK13 + (ch ^ (row & 7)) * 8]), &A[(size_t)(ok ? row : 0) * K + k + ch * 8], ok);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {                        // W: 128 rows x 8 chunks of packed FP4
+            int idx = tid + i * 128, row = idx >> 3, ch = idx & 7;
+            cp_async16(smem_u32(&Wb(st)[row * 128 + (ch ^ (row & 7)) * 16]), &Wq[(size_t)(n0 + row) * (K / 2) + k / 2 + ch * 16]);
+        }
+        cp_async16(smem_u32(&Sc(st)[tid * 8]), &Ws[(size_t)(n0 + tid) * G + k / 32]);   // 8 scales per row
+    };
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < KT) load(s, s);
+        cp_async_commit();
+    }
+    float acc[4][4] = {};
+    const half2 two14 = __float2half2_rn(16384.f);
+    for (int kt = 0; kt < KT; ++kt) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        if (kt + STAGES - 1 < KT) load((kt + STAGES - 1) % STAGES, kt + STAGES - 1);
+        cp_async_commit();
+        int st = kt % STAGES;
+        const half* as = As(st);
+        const uint8_t* wb = Wb(st);
+        const half* sc = Sc(st);
+#pragma unroll
+        for (int kk = 0; kk < BK13; kk += 16) {
+            uint32_t a[4], b[4][2];
+            int arow = lane & 15, ach = (kk >> 3) + (lane >> 4);
+            ldmatrix_x4(a[0], a[1], a[2], a[3], smem_u32(&as[arow * BK13 + (ach ^ (arow & 7)) * 8]));
+#pragma unroll
+            for (int ni = 0; ni < 4; ++ni) {
+                // B fragment of m16n8k16: n = lane / 4, k pairs at 2*(lane%4) and 8 + 2*(lane%4)
+                int n = wn * 32 + ni * 8 + (lane >> 2);
+                half2 s2 = __hmul2(__half2half2(sc[n * 8 + kk / 32]), two14);
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    int kb = kk / 2 + h * 4 + (lane & 3);
+                    uint32_t v = wb[n * 128 + (((kb >> 4) ^ (n & 7)) << 4) + (kb & 15)];
+                    uint32_t raw = e2m1x2_to_half2(v);
+                    half2 w = __hmul2(*reinterpret_cast<half2*>(&raw), s2);
+                    b[ni][h] = *reinterpret_cast<uint32_t*>(&w);
+                }
+            }
+#pragma unroll
+            for (int ni = 0; ni < 4; ++ni) mma_16816(acc[ni], a, b[ni]);
+        }
+    }
+    cp_async_wait<0>();
+    int r = lane >> 2;
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) {
+        int c = n0 + wn * 32 + ni * 8 + (lane & 3) * 2;
+        if (r < M) { atomicAdd(&Cf[(size_t)r * N + c], acc[ni][0]); atomicAdd(&Cf[(size_t)r * N + c + 1], acc[ni][1]); }
+        if (r + 8 < M) { atomicAdd(&Cf[(size_t)(r + 8) * N + c], acc[ni][2]); atomicAdd(&Cf[(size_t)(r + 8) * N + c + 1], acc[ni][3]); }
+    }
+}

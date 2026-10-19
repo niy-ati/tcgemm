@@ -387,6 +387,109 @@ static void backward_bench(void* flush, size_t flush_bytes) {
     }
 }
 
+// FP4=1 ./bench : decode GEMM with FP4 (E2M1, group-32 fp16 scale) weights.
+// Weights are quantized on the host (scale = absmax / 6, round to nearest code).
+// Correctness: against cuBLAS run on the dequantized fp16 weights, so the check
+// isolates the kernel from quantization error (reported separately vs the fp16 GEMM).
+// Speed: against cuBLAS and v11 on the original fp16 weights, i.e. what FP4 replaces.
+static void fp4_bench(void* flush, size_t flush_bytes) {
+    struct S { int M, N, K; const char* name; };
+    std::vector<S> shapes = {{1, 4096, 4096, "decode_o_proj_m1"}, {16, 4096, 4096, "decode_o_proj_m16"},
+                             {1, 14336, 4096, "decode_up_proj_m1"}, {16, 14336, 4096, "decode_up_proj_m16"},
+                             {1, 4096, 14336, "decode_down_proj_m1"}, {16, 4096, 14336, "decode_down_proj_m16"}};
+    const float lut[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    std::mt19937 rng(3);
+    std::normal_distribution<float> Nd(0.f, 1.f);
+    static bool attr = (cudaFuncSetAttribute(k13_fp4, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM13), true);
+    (void)attr;
+    for (const S& sh : shapes) {
+        int M = sh.M, N = sh.N, K = sh.K, G = K / 32;
+        std::vector<half> hA((size_t)M * K), hW((size_t)N * K), hWd((size_t)N * K), hS((size_t)N * G);
+        std::vector<uint8_t> hQ((size_t)N * K / 2, 0);
+        for (auto& v : hA) v = __float2half(Nd(rng));
+        for (auto& v : hW) v = __float2half(Nd(rng) * 0.02f);
+        for (int n = 0; n < N; ++n)
+            for (int g = 0; g < G; ++g) {
+                float amax = 0;
+                for (int k = g * 32; k < g * 32 + 32; ++k) amax = std::max(amax, std::fabs(__half2float(hW[(size_t)n * K + k])));
+                half sc = __float2half(amax > 0 ? amax / 6.f : 1.f);
+                hS[(size_t)n * G + g] = sc;
+                float fs = __half2float(sc);
+                for (int k = g * 32; k < g * 32 + 32; ++k) {
+                    float x = __half2float(hW[(size_t)n * K + k]) / fs;
+                    int best = 0;
+                    for (int c = 1; c < 8; ++c) if (std::fabs(std::fabs(x) - lut[c]) < std::fabs(std::fabs(x) - lut[best])) best = c;
+                    int code = best | (x < 0 && best ? 8 : 0);
+                    hQ[((size_t)n * K + k) / 2] |= (uint8_t)(code << ((k & 1) * 4));
+                    hWd[(size_t)n * K + k] = __float2half((code & 8 ? -1.f : 1.f) * lut[code & 7] * fs);
+                }
+            }
+        half *A, *W, *Wd, *Sc, *C, *Cref, *C16;
+        uint8_t* Q;
+        CK(cudaMalloc(&A, hA.size() * 2)); CK(cudaMalloc(&W, hW.size() * 2)); CK(cudaMalloc(&Wd, hWd.size() * 2));
+        CK(cudaMalloc(&Sc, hS.size() * 2)); CK(cudaMalloc(&Q, hQ.size()));
+        CK(cudaMalloc(&C, (size_t)M * N * 2)); CK(cudaMalloc(&Cref, (size_t)M * N * 2)); CK(cudaMalloc(&C16, (size_t)M * N * 2));
+        CK(cudaMemcpy(A, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(W, hW.data(), hW.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(Wd, hWd.data(), hWd.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(Sc, hS.data(), hS.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(Q, hQ.data(), hQ.size(), cudaMemcpyHostToDevice));
+        size_t n = (size_t)M * N;
+        if (n > g_ws_elems) {
+            if (g_ws) CK(cudaFree(g_ws));
+            CK(cudaMalloc(&g_ws, n * 4));
+            g_ws_elems = n;
+        }
+        int split = 1;
+        auto run = [&] {
+            CK(cudaMemsetAsync(g_ws, 0, n * 4));
+            k13_fp4<<<dim3(N / BN10, split), 128, SMEM13>>>(A, Q, Sc, g_ws, M, N, K, K / split);
+            k10_to_half<<<(int)((n + 255) / 256), 256>>>(g_ws, C, (int)n);
+        };
+        float best = 1e30f;
+        int pick = 1;
+        for (int sp : {1, 2, 4, 8, 16}) {
+            if (K % (sp * BK13)) continue;
+            split = sp;
+            for (int w = 0; w < 2; ++w) run();
+            float ms = time_ms(run, flush, flush_bytes, 15);
+            if (ms < best) { best = ms; pick = sp; }
+        }
+        split = pick;
+        cublas_gemm(A, Wd, Cref, M, N, K);
+        cublas_gemm(A, W, C16, M, N, K);
+        run();
+        CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        std::vector<half> hC(n), hR(n), h16(n);
+        CK(cudaMemcpy(hC.data(), C, n * 2, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hR.data(), Cref, n * 2, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(h16.data(), C16, n * 2, cudaMemcpyDeviceToHost));
+        size_t bad = 0;
+        double max_err = 0, qnum = 0, qden = 0;
+        for (size_t i = 0; i < n; ++i) {
+            double r = __half2float(hR[i]), c = __half2float(hC[i]), f = __half2float(h16[i]), d = std::fabs(c - r);
+            if (!(d <= 0.02 + 1e-2 * std::fabs(r))) ++bad;
+            max_err = std::max(max_err, std::isnan(d) ? INFINITY : d);
+            qnum += (c - f) * (c - f);
+            qden += f * f;
+        }
+        for (int w = 0; w < 3; ++w) { run(); cublas_gemm(A, W, C16, M, N, K); launch_splitk11(A, W, C16, M, N, K); }
+        float t4 = time_ms(run, flush, flush_bytes, 30);
+        float tb = time_ms([&] { cublas_gemm(A, W, C16, M, N, K); }, flush, flush_bytes, 30);
+        float t11 = time_ms([&] { launch_splitk11(A, W, C16, M, N, K); }, flush, flush_bytes, 30);
+        double bytes4 = (double)N * K / 2 + (double)N * G * 2 + (double)M * K * 2 + (double)M * N * 2;
+        printf("{\"mode\":\"fp4\",\"shape\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"split\":%d,\"fp4_ms\":%.4f,\"fp4_gbps\":%.1f,"
+               "\"cublas_fp16_ms\":%.4f,\"v11_fp16_ms\":%.4f,\"speedup_vs_cublas_fp16\":%.3f,\"max_abs_err\":%.4g,\"bad\":%zu,"
+               "\"correct\":%s,\"quant_rel_err\":%.4f}\n",
+               sh.name, M, N, K, pick, t4, bytes4 / t4 / 1e6, tb, t11, tb / t4, max_err, bad, bad == 0 ? "true" : "false",
+               std::sqrt(qnum / qden));
+        fflush(stdout);
+        CK(cudaFree(A)); CK(cudaFree(W)); CK(cudaFree(Wd)); CK(cudaFree(Sc)); CK(cudaFree(Q));
+        CK(cudaFree(C)); CK(cudaFree(Cref)); CK(cudaFree(C16));
+    }
+}
+
 int main(int argc, char** argv) {
     std::vector<std::string> want(argv + 1, argv + argc);
     // Square plus LLM shapes: Qwen3-8B / Llama-3-8B attention-out and MLP projections at prefill M.
@@ -410,6 +513,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "GPU %s, SMs %d, L2 %d KB\n", prop.name, prop.multiProcessorCount, prop.l2CacheSize / 1024);
     if (getenv("EPI")) { epilogue_bench(flush, flush_bytes); return 0; }
     if (getenv("BWD")) { backward_bench(flush, flush_bytes); return 0; }
+    if (getenv("FP4")) { fp4_bench(flush, flush_bytes); return 0; }
 
     std::mt19937 rng(0);
     std::uniform_real_distribution<float> U(-1.f, 1.f);
