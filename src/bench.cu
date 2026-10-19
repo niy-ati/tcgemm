@@ -7,6 +7,7 @@
 // element-wise against it, then timed with CUDA events around the kernel
 // only, L2 flushed before every repetition, median of the repetitions.
 // One JSON line per (kernel, shape) on stdout.
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -90,6 +91,66 @@ static void launch_auto(const half* A, const half* W, half* C, int M, int N, int
     cand[it->second](A, W, C, M, N, K);
 }
 
+// Stronger baseline: cuBLASLt asked for up to 16 algorithms for the shape,
+// each timed, fastest kept ("did you autotune cuBLAS too?"). Same column-major
+// trick as cublas_gemm. Workspace 32 MB so split-K algorithms are eligible.
+static cublasLtHandle_t g_lt;
+struct LtPlan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; int n_tried; };
+static std::map<std::tuple<int, int, int>, LtPlan> g_lt_plans;
+static void* g_lt_ws = nullptr;
+static const size_t LT_WS = 32u << 20;
+static void lt_run(const LtPlan& p, const half* A, const half* W, half* C) {
+    float alpha = 1.f, beta = 0.f;
+    CB(cublasLtMatmul(g_lt, p.op, &alpha, W, p.a, A, p.b, &beta, C, p.c, C, p.c, &p.algo, g_lt_ws, LT_WS, 0));
+}
+static void cublaslt_best(const half* A, const half* W, half* C, int M, int N, int K) {
+    auto key = std::make_tuple(M, N, K);
+    auto it = g_lt_plans.find(key);
+    if (it == g_lt_plans.end()) {
+        if (!g_lt_ws) CK(cudaMalloc(&g_lt_ws, LT_WS));
+        LtPlan p{};
+        cublasOperation_t tA = CUBLAS_OP_T, tB = CUBLAS_OP_N;
+        CB(cublasLtMatmulDescCreate(&p.op, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        CB(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &tA, sizeof(tA)));
+        CB(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tB, sizeof(tB)));
+        CB(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_16F, K, N, K));   // W viewed as K x N col-major, op T
+        CB(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16F, K, M, K));   // A viewed as K x M col-major
+        CB(cublasLtMatrixLayoutCreate(&p.c, CUDA_R_16F, N, M, N));   // C^T, N x M col-major
+        cublasLtMatmulPreference_t pref;
+        CB(cublasLtMatmulPreferenceCreate(&pref));
+        CB(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &LT_WS, sizeof(LT_WS)));
+        cublasLtMatmulHeuristicResult_t res[16];
+        int found = 0;
+        CB(cublasLtMatmulAlgoGetHeuristic(g_lt, p.op, p.a, p.b, p.c, p.c, pref, 16, res, &found));
+        cudaEvent_t s0, e0;
+        CK(cudaEventCreate(&s0));
+        CK(cudaEventCreate(&e0));
+        float best = 1e30f;
+        for (int i = 0; i < found; ++i) {
+            p.algo = res[i].algo;
+            float alpha = 1.f, beta = 0.f;
+            if (cublasLtMatmul(g_lt, p.op, &alpha, W, p.a, A, p.b, &beta, C, p.c, C, p.c, &p.algo, g_lt_ws, LT_WS, 0) != CUBLAS_STATUS_SUCCESS) continue;
+            std::vector<float> t;
+            for (int r = 0; r < 9; ++r) {
+                CK(cudaEventRecord(s0));
+                lt_run(p, A, W, C);
+                CK(cudaEventRecord(e0));
+                CK(cudaEventSynchronize(e0));
+                float ms;
+                CK(cudaEventElapsedTime(&ms, s0, e0));
+                t.push_back(ms);
+            }
+            std::sort(t.begin(), t.end());
+            if (t[4] < best) { best = t[4]; res[0].algo = res[i].algo; }
+        }
+        p.algo = res[0].algo;
+        p.n_tried = found;
+        fprintf(stderr, "cublaslt %dx%dx%d: best of %d heuristic algorithms\n", M, N, K, found);
+        it = g_lt_plans.emplace(key, p).first;
+    }
+    lt_run(it->second, A, W, C);
+}
+
 static std::vector<Kernel> kernels() {
     return {
         {"v0_naive", 16, 16, 1, [](const half* A, const half* W, half* C, int M, int N, int K) {
@@ -109,6 +170,7 @@ static std::vector<Kernel> kernels() {
         {"v7_bigtile", 256, 128, BK7, launch_v7},
         {"v9_widen", 128, 256, BK7, launch_v9},
         {"v8_autotune", BM3, BN3, BK3, launch_auto},
+        {"cublaslt_best", 1, 1, 1, cublaslt_best},
     };
 }
 
@@ -144,6 +206,7 @@ int main(int argc, char** argv) {
     size_t flush_bytes = (size_t)prop.l2CacheSize * 4;
     void* flush; CK(cudaMalloc(&flush, flush_bytes));
     CB(cublasCreate(&g_blas));
+    CB(cublasLtCreate(&g_lt));
     fprintf(stderr, "GPU %s, SMs %d, L2 %d KB\n", prop.name, prop.multiProcessorCount, prop.l2CacheSize / 1024);
 
     std::mt19937 rng(0);
