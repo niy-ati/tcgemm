@@ -310,3 +310,138 @@ __global__ void __launch_bounds__(256) k7_big(const half* A, const half* W, half
             *reinterpret_cast<half2*>(&C[(size_t)(r + 8) * N + c]) = __floats2half2_rn(acc[mi][ni][2], acc[mi][ni][3]);
         }
 }
+
+// ------------------------------------------------ v10: split-K decode GEMM (M <= 16)
+// Decode is bound by streaming W (N x K) from DRAM; the math is tiny. Two problems
+// with the prefill kernels: they need M % 128 == 0, and at M = 1 a 4096-wide layer
+// is only 32 blocks of 128 columns for 20 SMs. Here M is padded to 16 inside the
+// mma tile (rows >= M are zero-filled by cp.async with src-size 0, so they cost
+// no DRAM traffic), each block takes 128 columns and a 1/S slice of K, and the S
+// partial sums meet in an fp32 workspace via atomicAdd, then convert to fp16.
+// 4 warps, each a 16 x 32 output slice. Same 3-stage cp.async + swizzle as v5.
+constexpr int BN10 = 128, BK10 = 32;
+__device__ __forceinline__ void cp_async16_zfill(uint32_t dst, const void* src, bool valid) {
+    int bytes = valid ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(bytes));
+}
+__global__ void __launch_bounds__(128) k10_splitk(const half* A, const half* W, float* Cf, int M, int N, int K, int k_per_split) {
+    __shared__ __align__(128) half As[STAGES][16][BK10], Ws[STAGES][BN10][BK10];
+    int tid = threadIdx.x, lane = tid & 31, wn = tid >> 5;
+    int n0 = blockIdx.x * BN10, kbeg = blockIdx.y * k_per_split;
+    int KT = k_per_split / BK10;
+    auto load = [&](int st, int kt) {
+        int k = kbeg + kt * BK10;
+        if (tid < 64) {                                      // A: 16 rows x 4 chunks, rows >= M zero-filled
+            int row = tid >> 2, ch = tid & 3;
+            bool ok = row < M;
+            cp_async16_zfill(smem_u32(&As[st][row][swz<true>(row, ch) * 8]), &A[(size_t)(ok ? row : 0) * K + k + ch * 8], ok);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {                        // W: 128 rows x 4 chunks over 128 threads
+            int idx = tid + i * 128, row = idx >> 2, ch = idx & 3;
+            cp_async16(smem_u32(&Ws[st][row][swz<true>(row, ch) * 8]), &W[(size_t)(n0 + row) * K + k + ch * 8]);
+        }
+    };
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < KT) load(s, s);
+        cp_async_commit();
+    }
+    float acc[4][4] = {};
+    for (int kt = 0; kt < KT; ++kt) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        if (kt + STAGES - 1 < KT) load((kt + STAGES - 1) % STAGES, kt + STAGES - 1);
+        cp_async_commit();
+        int st = kt % STAGES;
+#pragma unroll
+        for (int kk = 0; kk < BK10; kk += 16) {
+            uint32_t a[4], b[4][2];
+            int arow = lane & 15, ach = (kk >> 3) + (lane >> 4);
+            ldmatrix_x4(a[0], a[1], a[2], a[3], smem_u32(&As[st][arow][swz<true>(arow, ach) * 8]));
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                int row = wn * 32 + p * 16 + (lane & 7) + (lane >> 4) * 8, ch = (kk >> 3) + ((lane >> 3) & 1);
+                ldmatrix_x4(b[2 * p][0], b[2 * p][1], b[2 * p + 1][0], b[2 * p + 1][1], smem_u32(&Ws[st][row][swz<true>(row, ch) * 8]));
+            }
+#pragma unroll
+            for (int ni = 0; ni < 4; ++ni) mma_16816(acc[ni], a, b[ni]);
+        }
+    }
+    cp_async_wait<0>();
+    int r = lane >> 2;
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) {
+        int c = n0 + wn * 32 + ni * 8 + (lane & 3) * 2;
+        if (r < M) { atomicAdd(&Cf[(size_t)r * N + c], acc[ni][0]); atomicAdd(&Cf[(size_t)r * N + c + 1], acc[ni][1]); }
+        if (r + 8 < M) { atomicAdd(&Cf[(size_t)(r + 8) * N + c], acc[ni][2]); atomicAdd(&Cf[(size_t)(r + 8) * N + c + 1], acc[ni][3]); }
+    }
+}
+__global__ void k10_to_half(const float* Cf, half* C, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) C[i] = __float2half(Cf[i]);
+}
+
+// ------------------------------------- v11: split-K decode with 128-byte row reads
+// v10 reads each W row 64 bytes at a time (BK = 32 halves) across 128 rows that sit
+// K * 2 bytes apart: many short, scattered DRAM bursts. v11 takes BK = 64, so each
+// row is read as one contiguous 128-byte segment per step. Rows are 8 chunks of 16 B,
+// so the swizzle becomes chunk ^ (row & 7). 3 stages x (16 + 128) x 64 x 2 B = 54 KB:
+// dynamic shared memory.
+constexpr int BK11 = 64, SMEM11 = STAGES * (16 + BN10) * BK11 * 2;
+__device__ __forceinline__ int swz8(int row, int chunk) { return chunk ^ (row & 7); }
+__global__ void __launch_bounds__(128) k11_splitk(const half* A, const half* W, float* Cf, int M, int N, int K, int k_per_split) {
+    extern __shared__ __align__(128) half sm11[];
+    auto As = [&](int st, int row, int col) -> half* { return &sm11[(st * 16 + row) * BK11 + col]; };
+    auto Ws = [&](int st, int row, int col) -> half* { return &sm11[STAGES * 16 * BK11 + (st * BN10 + row) * BK11 + col]; };
+    int tid = threadIdx.x, lane = tid & 31, wn = tid >> 5;
+    int n0 = blockIdx.x * BN10, kbeg = blockIdx.y * k_per_split;
+    int KT = k_per_split / BK11;
+    auto load = [&](int st, int kt) {
+        int k = kbeg + kt * BK11;
+        {                                                    // A: 16 rows x 8 chunks = 128, one per thread
+            int row = tid >> 3, ch = tid & 7;
+            bool ok = row < M;
+            cp_async16_zfill(smem_u32(As(st, row, swz8(row, ch) * 8)), &A[(size_t)(ok ? row : 0) * K + k + ch * 8], ok);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {                        // W: 128 rows x 8 chunks over 128 threads
+            int idx = tid + i * 128, row = idx >> 3, ch = idx & 7;
+            cp_async16(smem_u32(Ws(st, row, swz8(row, ch) * 8)), &W[(size_t)(n0 + row) * K + k + ch * 8]);
+        }
+    };
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < KT) load(s, s);
+        cp_async_commit();
+    }
+    float acc[4][4] = {};
+    for (int kt = 0; kt < KT; ++kt) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        if (kt + STAGES - 1 < KT) load((kt + STAGES - 1) % STAGES, kt + STAGES - 1);
+        cp_async_commit();
+        int st = kt % STAGES;
+#pragma unroll
+        for (int kk = 0; kk < BK11; kk += 16) {
+            uint32_t a[4], b[4][2];
+            int arow = lane & 15, ach = (kk >> 3) + (lane >> 4);
+            ldmatrix_x4(a[0], a[1], a[2], a[3], smem_u32(As(st, arow, swz8(arow, ach) * 8)));
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                int row = wn * 32 + p * 16 + (lane & 7) + (lane >> 4) * 8, ch = (kk >> 3) + ((lane >> 3) & 1);
+                ldmatrix_x4(b[2 * p][0], b[2 * p][1], b[2 * p + 1][0], b[2 * p + 1][1], smem_u32(Ws(st, row, swz8(row, ch) * 8)));
+            }
+#pragma unroll
+            for (int ni = 0; ni < 4; ++ni) mma_16816(acc[ni], a, b[ni]);
+        }
+    }
+    cp_async_wait<0>();
+    int r = lane >> 2;
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) {
+        int c = n0 + wn * 32 + ni * 8 + (lane & 3) * 2;
+        if (r < M) { atomicAdd(&Cf[(size_t)r * N + c], acc[ni][0]); atomicAdd(&Cf[(size_t)r * N + c + 1], acc[ni][1]); }
+        if (r + 8 < M) { atomicAdd(&Cf[(size_t)(r + 8) * N + c], acc[ni][2]); atomicAdd(&Cf[(size_t)(r + 8) * N + c + 1], acc[ni][3]); }
+    }
+}

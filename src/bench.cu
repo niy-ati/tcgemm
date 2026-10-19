@@ -151,6 +151,62 @@ static void cublaslt_best(const half* A, const half* W, half* C, int M, int N, i
     lt_run(it->second, A, W, C);
 }
 
+// v10 launcher: zero the fp32 workspace, split-K kernel, convert to fp16. All
+// three are inside the timed region. The split factor S is autotuned per shape.
+static float* g_ws = nullptr;
+static size_t g_ws_elems = 0;
+static std::map<std::tuple<int, int, int, int>, int> g_split;
+static void splitk_run(const half* A, const half* W, half* C, int M, int N, int K, int S, int ver = 10) {
+    size_t n = (size_t)M * N;
+    if (n > g_ws_elems) {
+        if (g_ws) CK(cudaFree(g_ws));
+        CK(cudaMalloc(&g_ws, n * 4));
+        g_ws_elems = n;
+    }
+    CK(cudaMemsetAsync(g_ws, 0, n * 4));
+    if (ver == 11) {
+        static bool attr = (cudaFuncSetAttribute(k11_splitk, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM11), true);
+        (void)attr;
+        k11_splitk<<<dim3(N / BN10, S), 128, SMEM11>>>(A, W, g_ws, M, N, K, K / S);
+    } else {
+        k10_splitk<<<dim3(N / BN10, S), 128>>>(A, W, g_ws, M, N, K, K / S);
+    }
+    k10_to_half<<<(int)((n + 255) / 256), 256>>>(g_ws, C, (int)n);
+}
+static void launch_splitk_v(const half* A, const half* W, half* C, int M, int N, int K, int ver) {
+    int bk = ver == 11 ? BK11 : BK10;
+    auto key = std::make_tuple(M, N, K, ver);
+    auto it = g_split.find(key);
+    if (it == g_split.end()) {
+        float best = 1e30f;
+        int pick = 1;
+        cudaEvent_t s0, e0;
+        CK(cudaEventCreate(&s0));
+        CK(cudaEventCreate(&e0));
+        for (int S : {1, 2, 4, 8, 16, 32}) {
+            if (K % (S * bk)) continue;
+            for (int w = 0; w < 2; ++w) splitk_run(A, W, C, M, N, K, S, ver);
+            std::vector<float> t;
+            for (int r = 0; r < 15; ++r) {
+                CK(cudaEventRecord(s0));
+                splitk_run(A, W, C, M, N, K, S, ver);
+                CK(cudaEventRecord(e0));
+                CK(cudaEventSynchronize(e0));
+                float ms;
+                CK(cudaEventElapsedTime(&ms, s0, e0));
+                t.push_back(ms);
+            }
+            std::sort(t.begin(), t.end());
+            if (t[7] < best) { best = t[7]; pick = S; }
+        }
+        it = g_split.emplace(key, pick).first;
+        fprintf(stderr, "splitk v%d %dx%dx%d -> S=%d\n", ver, M, N, K, pick);
+    }
+    splitk_run(A, W, C, M, N, K, it->second, ver);
+}
+static void launch_splitk(const half* A, const half* W, half* C, int M, int N, int K) { launch_splitk_v(A, W, C, M, N, K, 10); }
+static void launch_splitk11(const half* A, const half* W, half* C, int M, int N, int K) { launch_splitk_v(A, W, C, M, N, K, 11); }
+
 static std::vector<Kernel> kernels() {
     return {
         {"v0_naive", 16, 16, 1, [](const half* A, const half* W, half* C, int M, int N, int K) {
@@ -171,6 +227,8 @@ static std::vector<Kernel> kernels() {
         {"v9_widen", 128, 256, BK7, launch_v9},
         {"v8_autotune", BM3, BN3, BK3, launch_auto},
         {"cublaslt_best", 1, 1, 1, cublaslt_best},
+        {"v10_splitk", 1, BN10, BK10, launch_splitk},
+        {"v11_splitk_bk64", 1, BN10, BK11, launch_splitk11},
     };
 }
 
@@ -199,6 +257,10 @@ int main(int argc, char** argv) {
         {2048, 4096, 4096, "llama8b_o_proj_m2048"},
         {2048, 14336, 4096, "llama8b_up_proj_m2048"},
         {2048, 4096, 14336, "llama8b_down_proj_m2048"},
+        // decode: M = tokens in flight
+        {1, 4096, 4096, "decode_o_proj_m1"}, {4, 4096, 4096, "decode_o_proj_m4"}, {16, 4096, 4096, "decode_o_proj_m16"},
+        {1, 14336, 4096, "decode_up_proj_m1"}, {16, 14336, 4096, "decode_up_proj_m16"},
+        {1, 4096, 14336, "decode_down_proj_m1"}, {16, 4096, 14336, "decode_down_proj_m16"},
     };
     if (const char* only = getenv("SHAPE"))   // profile one shape: SHAPE=square_4096 ./bench ...
         shapes.erase(std::remove_if(shapes.begin(), shapes.end(), [&](const Shape& s) { return std::string(s.name) != only; }), shapes.end());
@@ -222,6 +284,7 @@ int main(int argc, char** argv) {
         CK(cudaMemcpy(A, hA.data(), nA * 2, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(W, hW.data(), nW * 2, cudaMemcpyHostToDevice));
         double flops = 2.0 * M * N * K;
+        double bytes = 2.0 * ((double)M * K + (double)N * K + (double)M * N);   // each operand moved once
 
         cublas_gemm(A, W, Cref, M, N, K);
         CK(cudaDeviceSynchronize());
@@ -229,13 +292,14 @@ int main(int argc, char** argv) {
         CK(cudaMemcpy(hRef.data(), Cref, nC * 2, cudaMemcpyDeviceToHost));
         for (int w = 0; w < 3; ++w) cublas_gemm(A, W, Cref, M, N, K);
         float blas_ms = time_ms([&] { cublas_gemm(A, W, Cref, M, N, K); }, flush, flush_bytes, 20);
-        printf("{\"kernel\":\"cublas\",\"shape\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"ms\":%.4f,\"tflops\":%.3f}\n",
-               sh.name, M, N, K, blas_ms, flops / blas_ms / 1e9);
+        printf("{\"kernel\":\"cublas\",\"shape\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"ms\":%.4f,\"tflops\":%.3f,\"gbps\":%.1f}\n",
+               sh.name, M, N, K, blas_ms, flops / blas_ms / 1e9, bytes / blas_ms / 1e6);
         fflush(stdout);
 
         for (const Kernel& kr : kernels()) {
             if (!want.empty() && std::find(want.begin(), want.end(), kr.name) == want.end()) continue;
             if (M % kr.tile_m || N % kr.tile_n || K % kr.tile_k) continue;
+            if (std::string(kr.name).find("splitk") != std::string::npos && M > 16) continue;   // decode kernel: one 16-row mma tile
             CK(cudaMemset(C, 0, nC * 2));
             kr.launch(A, W, C, M, N, K);
             CK(cudaGetLastError());
@@ -253,8 +317,8 @@ int main(int argc, char** argv) {
             int reps = std::max(3, std::min(20, (int)(2000.f / std::max(probe, 0.01f))));
             float ms = time_ms([&] { kr.launch(A, W, C, M, N, K); }, flush, flush_bytes, reps);
             printf("{\"kernel\":\"%s\",\"shape\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"ms\":%.4f,\"tflops\":%.3f,"
-                   "\"pct_cublas\":%.1f,\"max_abs_err\":%.4g,\"bad\":%zu,\"correct\":%s,\"reps\":%d}\n",
-                   kr.name, sh.name, M, N, K, ms, flops / ms / 1e9, 100.0 * blas_ms / ms, max_err, bad,
+                   "\"gbps\":%.1f,\"pct_cublas\":%.1f,\"max_abs_err\":%.4g,\"bad\":%zu,\"correct\":%s,\"reps\":%d}\n",
+                   kr.name, sh.name, M, N, K, ms, flops / ms / 1e9, bytes / ms / 1e6, 100.0 * blas_ms / ms, max_err, bad,
                    bad == 0 ? "true" : "false", reps);
             fflush(stdout);
         }
