@@ -34,6 +34,45 @@ static void cublas_gemm(const half* A, const half* W, half* C, int M, int N, int
                     &beta, C, CUDA_R_16F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
 
+// v8: per-shape autotuning. The first call for a shape times each candidate
+// (v6 128x128, v7 256x128) and caches the fastest; later calls dispatch to it.
+// No single tile wins every shape (see results), which is what cuBLAS's
+// heuristics handle too.
+#include <map>
+#include <tuple>
+static void launch_v6(const half* A, const half* W, half* C, int M, int N, int K) {
+    k45_pipe<true, true><<<(N / BN3) * (M / BM3), 256>>>(A, W, C, M, N, K);
+}
+static void launch_v7(const half* A, const half* W, half* C, int M, int N, int K) {
+    static bool attr = (cudaFuncSetAttribute(k7_big, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM7), true);
+    (void)attr;
+    k7_big<<<(N / BN7) * (M / BM7), 256, SMEM7>>>(A, W, C, M, N, K);
+}
+static std::map<std::tuple<int, int, int>, int> g_choice;
+static void launch_auto(const half* A, const half* W, half* C, int M, int N, int K) {
+    auto key = std::make_tuple(M, N, K);
+    auto it = g_choice.find(key);
+    if (it == g_choice.end()) {
+        void (*cand[2])(const half*, const half*, half*, int, int, int) = {launch_v6, launch_v7};
+        float best = 1e30f; int pick = 0;
+        cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+        for (int c = 0; c < 2; ++c) {
+            if (c == 1 && (M % BM7 || N % BN7)) continue;
+            cand[c](A, W, C, M, N, K);                       // warm-up
+            float t = 0;
+            for (int r = 0; r < 5; ++r) {
+                cudaEventRecord(s); cand[c](A, W, C, M, N, K); cudaEventRecord(e); cudaEventSynchronize(e);
+                float ms; cudaEventElapsedTime(&ms, s, e); t += ms;
+            }
+            if (t < best) { best = t; pick = c; }
+        }
+        cudaEventDestroy(s); cudaEventDestroy(e);
+        it = g_choice.emplace(key, pick).first;
+        fprintf(stderr, "autotune %dx%dx%d -> %s\n", M, N, K, pick ? "v7_bigtile" : "v6_raster");
+    }
+    (it->second ? launch_v7 : launch_v6)(A, W, C, M, N, K);
+}
+
 static std::vector<Kernel> kernels() {
     return {
         {"v0_naive", 16, 16, 1, [](const half* A, const half* W, half* C, int M, int N, int K) {
@@ -54,6 +93,7 @@ static std::vector<Kernel> kernels() {
              static bool attr = (cudaFuncSetAttribute(k7_big, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM7), true);
              (void)attr;
              k7_big<<<(N / BN7) * (M / BM7), 256, SMEM7>>>(A, W, C, M, N, K); }},
+        {"v8_autotune", BM3, BN3, BK3, launch_auto},
     };
 }
 
