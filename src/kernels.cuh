@@ -146,3 +146,76 @@ __global__ void __launch_bounds__(256) k3_mma(const half* A, const half* W, half
             *reinterpret_cast<half2*>(&C[(size_t)(r + 8) * N + c]) = __floats2half2_rn(acc[mi][ni][2], acc[mi][ni][3]);
         }
 }
+
+// ------------------------------------------- v4/v5: cp.async pipeline (+ swizzle)
+// v4: global -> smem copies go through cp.async (bypassing registers) into a
+// 3-stage ring, so tile k+2 loads while tile k computes. 3 x 16 KB = 48 KB.
+// v5: same, with an XOR swizzle on the 16-byte chunk index: chunk ^ ((row>>1)&3).
+// The 8 rows an ldmatrix reads then cover all 32 banks instead of two 16-bank
+// groups, removing v3/v4's 4-way bank conflict. Writes use the same mapping.
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+template <bool SWZ> __device__ __forceinline__ int swz(int row, int chunk) { return SWZ ? (chunk ^ ((row >> 1) & 3)) : chunk; }
+
+constexpr int STAGES = 3;
+template <bool SWZ>
+__global__ void __launch_bounds__(256) k45_pipe(const half* A, const half* W, half* C, int M, int N, int K) {
+    __shared__ __align__(128) half As[STAGES][BM3][BK3], Ws[STAGES][BN3][BK3];
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    int wm = warp / 4, wn = warp % 4;
+    int m0 = blockIdx.y * BM3, n0 = blockIdx.x * BN3;
+    int KT = K / BK3;
+    auto load = [&](int stage, int kt) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            int idx = tid + i * 256, row = idx >> 2, ch = idx & 3;
+            int pc = swz<SWZ>(row, ch) * 8;
+            cp_async16(smem_u32(&As[stage][row][pc]), &A[(size_t)(m0 + row) * K + kt * BK3 + ch * 8]);
+            cp_async16(smem_u32(&Ws[stage][row][pc]), &W[(size_t)(n0 + row) * K + kt * BK3 + ch * 8]);
+        }
+    };
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < KT) load(s, s);
+        cp_async_commit();
+    }
+    float acc[4][4][4] = {};
+    for (int kt = 0; kt < KT; ++kt) {
+        cp_async_wait<STAGES - 2>();   // tile kt has landed
+        __syncthreads();               // ...for every thread; and the slot refilled below is no longer being read
+        if (kt + STAGES - 1 < KT) load((kt + STAGES - 1) % STAGES, kt + STAGES - 1);
+        cp_async_commit();             // always commit, so group counting stays aligned at the tail
+        int st = kt % STAGES;
+#pragma unroll
+        for (int kk = 0; kk < BK3; kk += 16) {
+            uint32_t a[4][4], b[4][2];
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi) {
+                int row = wm * 64 + mi * 16 + (lane & 15), ch = (kk >> 3) + (lane >> 4);
+                ldmatrix_x4(a[mi][0], a[mi][1], a[mi][2], a[mi][3], smem_u32(&As[st][row][swz<SWZ>(row, ch) * 8]));
+            }
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                int row = wn * 32 + p * 16 + (lane & 7) + (lane >> 4) * 8, ch = (kk >> 3) + ((lane >> 3) & 1);
+                ldmatrix_x4(b[2 * p][0], b[2 * p][1], b[2 * p + 1][0], b[2 * p + 1][1], smem_u32(&Ws[st][row][swz<SWZ>(row, ch) * 8]));
+            }
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < 4; ++ni) mma_16816(acc[mi][ni], a[mi], b[ni]);
+        }
+    }
+    cp_async_wait<0>();
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+            int r = m0 + wm * 64 + mi * 16 + (lane >> 2), c = n0 + wn * 32 + ni * 8 + (lane & 3) * 2;
+            *reinterpret_cast<half2*>(&C[(size_t)r * N + c]) = __floats2half2_rn(acc[mi][ni][0], acc[mi][ni][1]);
+            *reinterpret_cast<half2*>(&C[(size_t)(r + 8) * N + c]) = __floats2half2_rn(acc[mi][ni][2], acc[mi][ni][3]);
+        }
+}

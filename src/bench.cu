@@ -44,6 +44,10 @@ static std::vector<Kernel> kernels() {
              k2_regblock<<<dim3(N / BN2, M / BM2), 256>>>(A, W, C, M, N, K); }},
         {"v3_mma", BM3, BN3, BK3, [](const half* A, const half* W, half* C, int M, int N, int K) {
              k3_mma<<<dim3(N / BN3, M / BM3), 256>>>(A, W, C, M, N, K); }},
+        {"v4_cpasync", BM3, BN3, BK3, [](const half* A, const half* W, half* C, int M, int N, int K) {
+             k45_pipe<false><<<dim3(N / BN3, M / BM3), 256>>>(A, W, C, M, N, K); }},
+        {"v5_swizzle", BM3, BN3, BK3, [](const half* A, const half* W, half* C, int M, int N, int K) {
+             k45_pipe<true><<<dim3(N / BN3, M / BM3), 256>>>(A, W, C, M, N, K); }},
     };
 }
 
