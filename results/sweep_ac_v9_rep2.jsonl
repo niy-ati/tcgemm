@@ -1,0 +1,8 @@
+{"kernel":"cublas","shape":"square_4096","M":4096,"N":4096,"K":4096,"ms":12.1477,"tflops":11.314}
+{"kernel":"v9_widen","shape":"square_4096","M":4096,"N":4096,"K":4096,"ms":9.6461,"tflops":14.248,"pct_cublas":125.9,"max_abs_err":0.0625,"bad":0,"correct":true,"reps":20}
+{"kernel":"cublas","shape":"llama8b_o_proj_m2048","M":2048,"N":4096,"K":4096,"ms":4.8456,"tflops":14.182}
+{"kernel":"v9_widen","shape":"llama8b_o_proj_m2048","M":2048,"N":4096,"K":4096,"ms":4.7729,"tflops":14.398,"pct_cublas":101.5,"max_abs_err":0,"bad":0,"correct":true,"reps":20}
+{"kernel":"cublas","shape":"llama8b_up_proj_m2048","M":2048,"N":14336,"K":4096,"ms":14.6954,"tflops":16.367}
+{"kernel":"v9_widen","shape":"llama8b_up_proj_m2048","M":2048,"N":14336,"K":4096,"ms":17.0691,"tflops":14.091,"pct_cublas":86.1,"max_abs_err":0,"bad":0,"correct":true,"reps":20}
+{"kernel":"cublas","shape":"llama8b_down_proj_m2048","M":2048,"N":4096,"K":14336,"ms":15.1296,"tflops":15.897}
+{"kernel":"v9_widen","shape":"llama8b_down_proj_m2048","M":2048,"N":4096,"K":14336,"ms":16.5837,"tflops":14.503,"pct_cublas":91.2,"max_abs_err":0,"bad":0,"correct":true,"reps":20}
