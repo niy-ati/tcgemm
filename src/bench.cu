@@ -50,6 +50,10 @@ static std::vector<Kernel> kernels() {
              k45_pipe<true><<<dim3(N / BN3, M / BM3), 256>>>(A, W, C, M, N, K); }},
         {"v6_raster", BM3, BN3, BK3, [](const half* A, const half* W, half* C, int M, int N, int K) {
              k45_pipe<true, true><<<(N / BN3) * (M / BM3), 256>>>(A, W, C, M, N, K); }},
+        {"v7_bigtile", BM7, BN7, BK7, [](const half* A, const half* W, half* C, int M, int N, int K) {
+             static bool attr = (cudaFuncSetAttribute(k7_big, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM7), true);
+             (void)attr;
+             k7_big<<<(N / BN7) * (M / BM7), 256, SMEM7>>>(A, W, C, M, N, K); }},
     };
 }
 

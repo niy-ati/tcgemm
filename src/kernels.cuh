@@ -234,3 +234,76 @@ __global__ void __launch_bounds__(256) k45_pipe(const half* A, const half* W, ha
             *reinterpret_cast<half2*>(&C[(size_t)(r + 8) * N + c]) = __floats2half2_rn(acc[mi][ni][2], acc[mi][ni][3]);
         }
 }
+
+// ------------------------------------------ v7: 256x128 block tile, 64x64 warp tile
+// cuBLAS picks a 256x128 tile here; v6's 128x128 leaves its warps doing 16 mma
+// per k-step for every 8 ldmatrix. With a 64x64 warp tile it is 32 mma per 12
+// ldmatrix, so more math per shared-memory byte. 8 warps as 4 (M) x 2 (N).
+// 3 stages x (16 KB A + 8 KB W) = 72 KB > the 48 KB static limit: dynamic smem.
+// Keeps v5's swizzle and v6's rasterization.
+constexpr int BM7 = 256, BN7 = 128, BK7 = 32;
+constexpr int SMEM7 = STAGES * (BM7 + BN7) * BK7 * 2;
+__global__ void __launch_bounds__(256) k7_big(const half* A, const half* W, half* C, int M, int N, int K) {
+    extern __shared__ __align__(128) half sm[];
+    auto As = [&](int st, int row, int col) -> half* { return &sm[(st * BM7 + row) * BK7 + col]; };
+    auto Ws = [&](int st, int row, int col) -> half* { return &sm[STAGES * BM7 * BK7 + (st * BN7 + row) * BK7 + col]; };
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    int wm = warp / 2, wn = warp % 2;                        // warp tile origin: (wm*64, wn*64)
+    int pid = blockIdx.x, grid_m = M / BM7, grid_n = N / BN7;
+    int group = pid / (GROUP_M * grid_n), first_m = group * GROUP_M;
+    int gm = min(grid_m - first_m, GROUP_M), in_group = pid % (GROUP_M * grid_n);
+    int m0 = (first_m + in_group % gm) * BM7, n0 = (in_group / gm) * BN7;
+    int KT = K / BK7;
+    auto load = [&](int st, int kt) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {                        // A: 256 rows x 4 chunks
+            int idx = tid + i * 256, row = idx >> 2, ch = idx & 3;
+            cp_async16(smem_u32(As(st, row, swz<true>(row, ch) * 8)), &A[(size_t)(m0 + row) * K + kt * BK7 + ch * 8]);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {                        // W: 128 rows x 4 chunks
+            int idx = tid + i * 256, row = idx >> 2, ch = idx & 3;
+            cp_async16(smem_u32(Ws(st, row, swz<true>(row, ch) * 8)), &W[(size_t)(n0 + row) * K + kt * BK7 + ch * 8]);
+        }
+    };
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < KT) load(s, s);
+        cp_async_commit();
+    }
+    float acc[4][8][4] = {};
+    for (int kt = 0; kt < KT; ++kt) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        if (kt + STAGES - 1 < KT) load((kt + STAGES - 1) % STAGES, kt + STAGES - 1);
+        cp_async_commit();
+        int st = kt % STAGES;
+#pragma unroll
+        for (int kk = 0; kk < BK7; kk += 16) {
+            uint32_t a[4][4], b[8][2];
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi) {
+                int row = wm * 64 + mi * 16 + (lane & 15), ch = (kk >> 3) + (lane >> 4);
+                ldmatrix_x4(a[mi][0], a[mi][1], a[mi][2], a[mi][3], smem_u32(As(st, row, swz<true>(row, ch) * 8)));
+            }
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                int row = wn * 64 + p * 16 + (lane & 7) + (lane >> 4) * 8, ch = (kk >> 3) + ((lane >> 3) & 1);
+                ldmatrix_x4(b[2 * p][0], b[2 * p][1], b[2 * p + 1][0], b[2 * p + 1][1], smem_u32(Ws(st, row, swz<true>(row, ch) * 8)));
+            }
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < 8; ++ni) mma_16816(acc[mi][ni], a[mi], b[ni]);
+        }
+    }
+    cp_async_wait<0>();
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 8; ++ni) {
+            int r = m0 + wm * 64 + mi * 16 + (lane >> 2), c = n0 + wn * 64 + ni * 8 + (lane & 3) * 2;
+            *reinterpret_cast<half2*>(&C[(size_t)r * N + c]) = __floats2half2_rn(acc[mi][ni][0], acc[mi][ni][1]);
+            *reinterpret_cast<half2*>(&C[(size_t)(r + 8) * N + c]) = __floats2half2_rn(acc[mi][ni][2], acc[mi][ni][3]);
+        }
+}
