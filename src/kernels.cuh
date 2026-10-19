@@ -162,12 +162,27 @@ template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile(
 template <bool SWZ> __device__ __forceinline__ int swz(int row, int chunk) { return SWZ ? (chunk ^ ((row >> 1) & 3)) : chunk; }
 
 constexpr int STAGES = 3;
-template <bool SWZ>
+// v6 adds threadblock rasterization (RASTER): blocks are numbered so that each
+// group of GROUP_M block-rows sweeps N together. Blocks resident at the same
+// time then share A row-tiles and W column-tiles, which stay in L2 instead of
+// being re-read from DRAM. Needs a 1-D grid.
+constexpr int GROUP_M = 8;
+template <bool SWZ, bool RASTER = false>
 __global__ void __launch_bounds__(256) k45_pipe(const half* A, const half* W, half* C, int M, int N, int K) {
     __shared__ __align__(128) half As[STAGES][BM3][BK3], Ws[STAGES][BN3][BK3];
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     int wm = warp / 4, wn = warp % 4;
-    int m0 = blockIdx.y * BM3, n0 = blockIdx.x * BN3;
+    int m0, n0;
+    if (RASTER) {
+        int pid = blockIdx.x, grid_m = M / BM3, grid_n = N / BN3;
+        int group = pid / (GROUP_M * grid_n), first_m = group * GROUP_M;
+        int gm = min(grid_m - first_m, GROUP_M), in_group = pid % (GROUP_M * grid_n);
+        m0 = (first_m + in_group % gm) * BM3;
+        n0 = (in_group / gm) * BN3;
+    } else {
+        m0 = blockIdx.y * BM3;
+        n0 = blockIdx.x * BN3;
+    }
     int KT = K / BK3;
     auto load = [&](int stage, int kt) {
 #pragma unroll

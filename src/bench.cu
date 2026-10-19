@@ -48,6 +48,8 @@ static std::vector<Kernel> kernels() {
              k45_pipe<false><<<dim3(N / BN3, M / BM3), 256>>>(A, W, C, M, N, K); }},
         {"v5_swizzle", BM3, BN3, BK3, [](const half* A, const half* W, half* C, int M, int N, int K) {
              k45_pipe<true><<<dim3(N / BN3, M / BM3), 256>>>(A, W, C, M, N, K); }},
+        {"v6_raster", BM3, BN3, BK3, [](const half* A, const half* W, half* C, int M, int N, int K) {
+             k45_pipe<true, true><<<(N / BN3) * (M / BM3), 256>>>(A, W, C, M, N, K); }},
     };
 }
 
@@ -77,6 +79,8 @@ int main(int argc, char** argv) {
         {2048, 14336, 4096, "llama8b_up_proj_m2048"},
         {2048, 4096, 14336, "llama8b_down_proj_m2048"},
     };
+    if (const char* only = getenv("SHAPE"))   // profile one shape: SHAPE=square_4096 ./bench ...
+        shapes.erase(std::remove_if(shapes.begin(), shapes.end(), [&](const Shape& s) { return std::string(s.name) != only; }), shapes.end());
     cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, 0));
     size_t flush_bytes = (size_t)prop.l2CacheSize * 4;
     void* flush; CK(cudaMalloc(&flush, flush_bytes));
