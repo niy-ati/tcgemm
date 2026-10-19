@@ -605,8 +605,12 @@ constexpr int STAGE13 = A13 + W13 + S13, SMEM13 = STAGES * STAGE13;
 __device__ __forceinline__ uint32_t e2m1x2_to_half2(uint32_t v) {
     return ((v & 0x7u) << 9) | ((v & 0x8u) << 12) | ((v & 0x70u) << 21) | ((v & 0x80u) << 24);
 }
-__global__ void __launch_bounds__(128) k13_fp4(const half* A, const uint8_t* Wq, const half* Ws, float* Cf, int M, int N, int K,
-                                               int k_per_split) {
+// WARPS = 8 gives each warp 16 of the 128 columns: same tile and shared memory, twice
+// the warps per SM (the 80 KB of stages allow only one block per SM).
+template <int WARPS = 4>
+__global__ void __launch_bounds__(WARPS * 32) k13_fp4(const half* A, const uint8_t* Wq, const half* Ws, float* Cf, int M, int N, int K,
+                                                      int k_per_split) {
+    constexpr int T = WARPS * 32, NI = 128 / 8 / WARPS;
     extern __shared__ __align__(128) uint8_t sm13[];
     auto As = [&](int st) { return reinterpret_cast<half*>(sm13 + st * STAGE13); };
     auto Wb = [&](int st) { return sm13 + st * STAGE13 + A13; };
@@ -617,24 +621,24 @@ __global__ void __launch_bounds__(128) k13_fp4(const half* A, const uint8_t* Wq,
     auto load = [&](int st, int kt) {
         int k = kbeg + kt * BK13;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {                        // A: 16 rows x 32 chunks
-            int idx = tid + i * 128, row = idx >> 5, ch = idx & 31;
+        for (int i = 0; i < 512 / T; ++i) {                  // A: 16 rows x 32 chunks
+            int idx = tid + i * T, row = idx >> 5, ch = idx & 31;
             bool ok = row < M;
             cp_async16_zfill(smem_u32(&As(st)[row * BK13 + (ch ^ (row & 7)) * 8]), &A[(size_t)(ok ? row : 0) * K + k + ch * 8], ok);
         }
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {                        // W: 128 rows x 8 chunks of packed FP4
-            int idx = tid + i * 128, row = idx >> 3, ch = idx & 7;
+        for (int i = 0; i < 1024 / T; ++i) {                 // W: 128 rows x 8 chunks of packed FP4
+            int idx = tid + i * T, row = idx >> 3, ch = idx & 7;
             cp_async16(smem_u32(&Wb(st)[row * 128 + (ch ^ (row & 7)) * 16]), &Wq[(size_t)(n0 + row) * (K / 2) + k / 2 + ch * 16]);
         }
-        cp_async16(smem_u32(&Sc(st)[tid * 8]), &Ws[(size_t)(n0 + tid) * G + k / 32]);   // 8 scales per row
+        if (tid < 128) cp_async16(smem_u32(&Sc(st)[tid * 8]), &Ws[(size_t)(n0 + tid) * G + k / 32]);   // 8 scales per row
     };
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < KT) load(s, s);
         cp_async_commit();
     }
-    float acc[4][4] = {};
+    float acc[NI][4] = {};
     const half2 two14 = __float2half2_rn(16384.f);
     for (int kt = 0; kt < KT; ++kt) {
         cp_async_wait<STAGES - 2>();
@@ -647,13 +651,13 @@ __global__ void __launch_bounds__(128) k13_fp4(const half* A, const uint8_t* Wq,
         const half* sc = Sc(st);
 #pragma unroll
         for (int kk = 0; kk < BK13; kk += 16) {
-            uint32_t a[4], b[4][2];
+            uint32_t a[4], b[NI][2];
             int arow = lane & 15, ach = (kk >> 3) + (lane >> 4);
             ldmatrix_x4(a[0], a[1], a[2], a[3], smem_u32(&as[arow * BK13 + (ach ^ (arow & 7)) * 8]));
 #pragma unroll
-            for (int ni = 0; ni < 4; ++ni) {
+            for (int ni = 0; ni < NI; ++ni) {
                 // B fragment of m16n8k16: n = lane / 4, k pairs at 2*(lane%4) and 8 + 2*(lane%4)
-                int n = wn * 32 + ni * 8 + (lane >> 2);
+                int n = wn * NI * 8 + ni * 8 + (lane >> 2);
                 half2 s2 = __hmul2(__half2half2(sc[n * 8 + kk / 32]), two14);
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
@@ -665,14 +669,14 @@ __global__ void __launch_bounds__(128) k13_fp4(const half* A, const uint8_t* Wq,
                 }
             }
 #pragma unroll
-            for (int ni = 0; ni < 4; ++ni) mma_16816(acc[ni], a, b[ni]);
+            for (int ni = 0; ni < NI; ++ni) mma_16816(acc[ni], a, b[ni]);
         }
     }
     cp_async_wait<0>();
     int r = lane >> 2;
 #pragma unroll
-    for (int ni = 0; ni < 4; ++ni) {
-        int c = n0 + wn * 32 + ni * 8 + (lane & 3) * 2;
+    for (int ni = 0; ni < NI; ++ni) {
+        int c = n0 + wn * NI * 8 + ni * 8 + (lane & 3) * 2;
         if (r < M) { atomicAdd(&Cf[(size_t)r * N + c], acc[ni][0]); atomicAdd(&Cf[(size_t)r * N + c + 1], acc[ni][1]); }
         if (r + 8 < M) { atomicAdd(&Cf[(size_t)(r + 8) * N + c], acc[ni][2]); atomicAdd(&Cf[(size_t)(r + 8) * N + c + 1], acc[ni][3]); }
     }

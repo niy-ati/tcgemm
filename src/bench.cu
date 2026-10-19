@@ -249,7 +249,8 @@ static float time_ms(const std::function<void()>& f, void* flush, size_t flush_b
     return t[t.size() / 2];
 }
 
-// EPI=1 ./bench : y = SiLU(A W^T + bias) + residual, three ways, on the prefill shapes.
+// EPI=1 ./bench : y = SiLU(A W^T + bias) + residual, four ways, on the prefill shapes.
+// v9+1_fused_kernel vs v9_fused_epilogue isolates the fusion itself from the GEMM's speed.
 // Reference: fp32 host computation from the fp16 GEMM result of cuBLAS (the GEMM
 // itself was validated above); the fused kernel keeps the pre-epilogue value in
 // fp32, so it differs from the unfused paths by at most one fp16 rounding.
@@ -400,9 +401,14 @@ static void fp4_bench(void* flush, size_t flush_bytes) {
     const float lut[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
     std::mt19937 rng(3);
     std::normal_distribution<float> Nd(0.f, 1.f);
-    static bool attr = (cudaFuncSetAttribute(k13_fp4, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM13), true);
+    static bool attr = (cudaFuncSetAttribute(k13_fp4<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM13),
+                        cudaFuncSetAttribute(k13_fp4<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM13), true);
     (void)attr;
+    const int warps = getenv("FP4_WARPS") ? atoi(getenv("FP4_WARPS")) : 8;
+    const char* only = getenv("SHAPE");
+    const char* force = getenv("FP4_SPLIT");   // fixed split, skips the split search (for profiling)
     for (const S& sh : shapes) {
+        if (only && std::string(only) != sh.name) continue;
         int M = sh.M, N = sh.N, K = sh.K, G = K / 32;
         std::vector<half> hA((size_t)M * K), hW((size_t)N * K), hWd((size_t)N * K), hS((size_t)N * G);
         std::vector<uint8_t> hQ((size_t)N * K / 2, 0);
@@ -443,13 +449,14 @@ static void fp4_bench(void* flush, size_t flush_bytes) {
         int split = 1;
         auto run = [&] {
             CK(cudaMemsetAsync(g_ws, 0, n * 4));
-            k13_fp4<<<dim3(N / BN10, split), 128, SMEM13>>>(A, Q, Sc, g_ws, M, N, K, K / split);
+            if (warps == 4) k13_fp4<4><<<dim3(N / BN10, split), 128, SMEM13>>>(A, Q, Sc, g_ws, M, N, K, K / split);
+            else k13_fp4<8><<<dim3(N / BN10, split), 256, SMEM13>>>(A, Q, Sc, g_ws, M, N, K, K / split);
             k10_to_half<<<(int)((n + 255) / 256), 256>>>(g_ws, C, (int)n);
         };
         float best = 1e30f;
         int pick = 1;
         for (int sp : {1, 2, 4, 8, 16}) {
-            if (K % (sp * BK13)) continue;
+            if (K % (sp * BK13) || (force && sp != atoi(force))) continue;
             split = sp;
             for (int w = 0; w < 2; ++w) run();
             float ms = time_ms(run, flush, flush_bytes, 15);
@@ -479,10 +486,10 @@ static void fp4_bench(void* flush, size_t flush_bytes) {
         float tb = time_ms([&] { cublas_gemm(A, W, C16, M, N, K); }, flush, flush_bytes, 30);
         float t11 = time_ms([&] { launch_splitk11(A, W, C16, M, N, K); }, flush, flush_bytes, 30);
         double bytes4 = (double)N * K / 2 + (double)N * G * 2 + (double)M * K * 2 + (double)M * N * 2;
-        printf("{\"mode\":\"fp4\",\"shape\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"split\":%d,\"fp4_ms\":%.4f,\"fp4_gbps\":%.1f,"
+        printf("{\"mode\":\"fp4\",\"warps\":%d,\"shape\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"split\":%d,\"fp4_ms\":%.4f,\"fp4_gbps\":%.1f,"
                "\"cublas_fp16_ms\":%.4f,\"v11_fp16_ms\":%.4f,\"speedup_vs_cublas_fp16\":%.3f,\"max_abs_err\":%.4g,\"bad\":%zu,"
                "\"correct\":%s,\"quant_rel_err\":%.4f}\n",
-               sh.name, M, N, K, pick, t4, bytes4 / t4 / 1e6, tb, t11, tb / t4, max_err, bad, bad == 0 ? "true" : "false",
+               warps, sh.name, M, N, K, pick, t4, bytes4 / t4 / 1e6, tb, t11, tb / t4, max_err, bad, bad == 0 ? "true" : "false",
                std::sqrt(qnum / qden));
         fflush(stdout);
         CK(cudaFree(A)); CK(cudaFree(W)); CK(cudaFree(Wd)); CK(cudaFree(Sc)); CK(cudaFree(Q));
