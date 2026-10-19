@@ -42,6 +42,8 @@ static std::vector<Kernel> kernels() {
              k1_smem<<<dim3(N / T1, M / T1), dim3(T1, T1)>>>(A, W, C, M, N, K); }},
         {"v2_regblock", BM2, BN2, BK2, [](const half* A, const half* W, half* C, int M, int N, int K) {
              k2_regblock<<<dim3(N / BN2, M / BM2), 256>>>(A, W, C, M, N, K); }},
+        {"v3_mma", BM3, BN3, BK3, [](const half* A, const half* W, half* C, int M, int N, int K) {
+             k3_mma<<<dim3(N / BN3, M / BM3), 256>>>(A, W, C, M, N, K); }},
     };
 }
 

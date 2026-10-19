@@ -4,6 +4,24 @@
 // Shapes must be multiples of the kernel's tile sizes (checked on the host).
 #pragma once
 #include <cuda_fp16.h>
+#include <cstdint>
+
+// ------------------------------------------------------- tensor-core helpers
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+// Four 8x8 b16 matrices from shared memory into the mma fragment layout.
+__device__ __forceinline__ void ldmatrix_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+// D(16x8, fp32) += A(16x16, fp16, row) * B(16x8, fp16, col)
+__device__ __forceinline__ void mma_16816(float* d, const uint32_t* a, const uint32_t* b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
 
 // ---------------------------------------------------------------- v0: naive
 // One thread per output element. Consecutive threads walk consecutive n, so
@@ -77,4 +95,54 @@ __global__ void __launch_bounds__(256) k2_regblock(const half* A, const half* W,
 #pragma unroll
         for (int j = 0; j < TN2; ++j)
             C[(size_t)(m0 + ty * TM2 + i) * N + n0 + tx * TN2 + j] = __float2half(acc[i][j]);
+}
+
+// ---------------------------------------------------- v3: tensor cores (mma.sync)
+// 128x128x32 block tile, 8 warps as 2 (M) x 4 (N), each warp a 64x32 tile =
+// 4 x 4 mma.m16n8k16 per 16-wide k step. A and W both have K contiguous, which
+// is exactly the row.col operand layout mma wants, so W needs no transpose.
+// Global -> smem with 16-byte vector loads; smem -> registers with ldmatrix.
+// Smem rows are 64 B (32 halves) with no swizzle: ldmatrix's 8 row addresses
+// land on only two 16-bank groups, a 4-way bank conflict that v5 removes.
+constexpr int BM3 = 128, BN3 = 128, BK3 = 32;
+__global__ void __launch_bounds__(256) k3_mma(const half* A, const half* W, half* C, int M, int N, int K) {
+    __shared__ __align__(16) half As[BM3][BK3], Ws[BN3][BK3];
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    int wm = warp / 4, wn = warp % 4;                       // warp tile origin: (wm*64, wn*32)
+    int m0 = blockIdx.y * BM3, n0 = blockIdx.x * BN3;
+    float acc[4][4][4] = {};
+    for (int k0 = 0; k0 < K; k0 += BK3) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {                       // 128 rows x 4 chunks of 8 halves, 2 per thread
+            int idx = tid + i * 256, row = idx >> 2, ch = (idx & 3) * 8;
+            *reinterpret_cast<uint4*>(&As[row][ch]) = *reinterpret_cast<const uint4*>(&A[(size_t)(m0 + row) * K + k0 + ch]);
+            *reinterpret_cast<uint4*>(&Ws[row][ch]) = *reinterpret_cast<const uint4*>(&W[(size_t)(n0 + row) * K + k0 + ch]);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < BK3; kk += 16) {
+            uint32_t a[4][4], b[4][2];
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi)                  // lanes 0-15: rows 0-15 at k; lanes 16-31: same rows at k+8
+                ldmatrix_x4(a[mi][0], a[mi][1], a[mi][2], a[mi][3],
+                            smem_u32(&As[wm * 64 + mi * 16 + (lane & 15)][kk + (lane >> 4) * 8]));
+#pragma unroll
+            for (int p = 0; p < 2; ++p)                     // one x4 load = two n8 tiles (k and k+8 halves each)
+                ldmatrix_x4(b[2 * p][0], b[2 * p][1], b[2 * p + 1][0], b[2 * p + 1][1],
+                            smem_u32(&Ws[wn * 32 + p * 16 + (lane & 7) + (lane >> 4) * 8][kk + ((lane >> 3) & 1) * 8]));
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < 4; ++ni) mma_16816(acc[mi][ni], a[mi], b[ni]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+            int r = m0 + wm * 64 + mi * 16 + (lane >> 2), c = n0 + wn * 32 + ni * 8 + (lane & 3) * 2;
+            *reinterpret_cast<half2*>(&C[(size_t)r * N + c]) = __floats2half2_rn(acc[mi][ni][0], acc[mi][ni][1]);
+            *reinterpret_cast<half2*>(&C[(size_t)(r + 8) * N + c]) = __floats2half2_rn(acc[mi][ni][2], acc[mi][ni][3]);
+        }
 }
