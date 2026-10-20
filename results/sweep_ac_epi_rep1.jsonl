@@ -1,0 +1,12 @@
+{"mode":"epilogue","kernel":"cublas+3_kernels","shape":"llama8b_up_proj_m2048","M":2048,"N":14336,"K":4096,"ms":17.8309,"speedup_vs_eager":1.000,"max_abs_err":0.0625,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"cublas+1_fused_kernel","shape":"llama8b_up_proj_m2048","M":2048,"N":14336,"K":4096,"ms":16.1208,"speedup_vs_eager":1.106,"max_abs_err":0.03125,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"v9+1_fused_kernel","shape":"llama8b_up_proj_m2048","M":2048,"N":14336,"K":4096,"ms":18.4412,"speedup_vs_eager":0.967,"max_abs_err":0.03125,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"v9_fused_epilogue","shape":"llama8b_up_proj_m2048","M":2048,"N":14336,"K":4096,"ms":20.2404,"speedup_vs_eager":0.881,"max_abs_err":0.06226,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"cublas+3_kernels","shape":"llama8b_down_proj_m2048","M":2048,"N":4096,"K":14336,"ms":16.0625,"speedup_vs_eager":1.000,"max_abs_err":0.123,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"cublas+1_fused_kernel","shape":"llama8b_down_proj_m2048","M":2048,"N":4096,"K":14336,"ms":15.5535,"speedup_vs_eager":1.033,"max_abs_err":0.0625,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"v9+1_fused_kernel","shape":"llama8b_down_proj_m2048","M":2048,"N":4096,"K":14336,"ms":17.0445,"speedup_vs_eager":0.942,"max_abs_err":0.0625,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"v9_fused_epilogue","shape":"llama8b_down_proj_m2048","M":2048,"N":4096,"K":14336,"ms":17.4244,"speedup_vs_eager":0.922,"max_abs_err":0.1241,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"cublas+3_kernels","shape":"llama8b_o_proj_m2048","M":2048,"N":4096,"K":4096,"ms":5.7733,"speedup_vs_eager":1.000,"max_abs_err":0.0625,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"cublas+1_fused_kernel","shape":"llama8b_o_proj_m2048","M":2048,"N":4096,"K":4096,"ms":5.2470,"speedup_vs_eager":1.100,"max_abs_err":0.03125,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"v9+1_fused_kernel","shape":"llama8b_o_proj_m2048","M":2048,"N":4096,"K":4096,"ms":5.2009,"speedup_vs_eager":1.110,"max_abs_err":0.03125,"bad":0,"correct":true}
+{"mode":"epilogue","kernel":"v9_fused_epilogue","shape":"llama8b_o_proj_m2048","M":2048,"N":4096,"K":4096,"ms":5.1907,"speedup_vs_eager":1.112,"max_abs_err":0.06161,"bad":0,"correct":true}

@@ -61,3 +61,62 @@ Longer contiguous reads (128 B per row per step) lifted every shape by 15-35%, a
 bursts were long the autotuner mostly chose S = 1-4: the extra parallelism from split-K
 mattered less than DRAM burst length. The smallest layer (o_proj, ~330 us/call) is noisy
 for both kernels across runs; ranges are shown rather than a single number.
+
+## Fused epilogue: y = SiLU(x W^T + bias) + residual (prefill, M = 2048)
+
+Median of 3 runs on AC (spread <= 1.8%). All four paths are checked against an fp32 host
+reference built from cuBLAS's GEMM output; all pass.
+
+| Shape | cuBLAS + 3 kernels | cuBLAS + 1 fused elementwise | v9 + 1 fused elementwise | v9, epilogue inside the GEMM |
+|---|---|---|---|---|
+| up_proj (2048 x 14336 x 4096) | 17.83 ms (1.00x) | 16.04 (1.11x) | 18.39 (0.97x) | 20.34 (0.88x) |
+| down_proj (2048 x 4096 x 14336) | 16.06 (1.00x) | 15.55 (1.03x) | 17.00 (0.94x) | 17.37 (0.92x) |
+| o_proj (2048 x 4096 x 4096) | 5.79 (1.00x) | 5.22 (1.11x) | 5.18 (1.12x) | 5.16 (1.12x) |
+
+Merging the three elementwise kernels into one saves 3-11%. Moving the epilogue into the
+GEMM helps only on o_proj and is **slower** on up_proj (20.34 vs 18.39 ms). Nsight Compute
+(`ncu_epilogue.md`): same 226 registers, no spills, but the fused kernel reads 0.45-0.6 GB
+more from DRAM per call, about 8x the 58.7 MB residual tensor it loads. The likely cause is
+the residual loads evicting the reused A/W tiles from the 1.5 MB L2; the obvious next
+step is an L2 evict-first hint (or a coalesced shared-memory stage) for the residual.
+
+## Backward pass: dX = dY W and dW = dY^T X, via `ldmatrix.trans` (v12)
+
+Median of 3 runs on AC. Correctness: element-wise vs cuBLAS (0 mismatches), and in a
+separate run both kernels vs an fp64 host reference on 512 sampled outputs per GEMM: ours
+and cuBLAS have identical error on every GEMM (0.014-0.034, fp16 output rounding).
+
+| Layer (tokens = 2048) | GEMM | cuBLAS TFLOPS | v12 TFLOPS | v12 / cuBLAS |
+|---|---|---|---|---|
+| o_proj | dX | 11.6 | 12.9 | 111% (96-131, noisy) |
+| o_proj | dW | 16.2 | 14.0 | 87% |
+| up_proj | dX | 16.1 | 13.3 | 83% |
+| up_proj | dW | 15.7 | 12.2 | 78% |
+| down_proj | dX | 16.4 | 10.7 | 65% |
+| down_proj | dW | 15.7 | 12.0 | 77% |
+
+v12 is a single 128 x 128 tile kernel with no per-shape tuning; it trails cuBLAS most
+where the forward pass needed the 128 x 256 tile (wide N or long K). The o_proj dX
+figure is high because cuBLAS's default algorithm is slow on it, and it varies widely
+between runs. A fourth run (`sweep_ac_bwd_fp64check`) was power- and thermal-throttled
+for its whole duration; it is kept for the fp64 check only, not for timing.
+
+## FP4 (E2M1) weight-only decode (v13)
+
+Timed with CUDA events at normal clocks, 8 warps, median of 3 runs, vs cuBLAS default on
+fp16 weights. The fp32 workspace memset and fp16 convert are inside the timed region.
+Kernel max abs error vs cuBLAS on the dequantized weights <= 0.008; quantization error
+itself ~10% relative on Gaussian weights.
+
+| Shape | v13 FP4 | cuBLAS fp16 | Speed-up |
+|---|---|---|---|
+| o_proj, M=1 | 0.107 ms | 0.281 ms | 2.63x |
+| o_proj, M=16 | 0.119 | 0.282 | 2.37x |
+| up_proj, M=1 | 0.289 | 0.940 | 3.25x |
+| up_proj, M=16 | 0.360 | 1.044 | 2.86x (1.99-3.17) |
+| down_proj, M=1 | 0.309 | 0.945 | 3.06x |
+| down_proj, M=16 | 0.340 | 1.085 | 3.20x |
+
+Small layers gain less because fixed costs (launch, memset, convert) are a larger share.
+At locked clocks in Nsight Compute the kernels alone run 3.15-3.24x faster than cuBLAS
+for 3.3-3.5x fewer bytes (`ncu_fp4_decode.md`). 4 vs 8 warps: within 1.5% everywhere.

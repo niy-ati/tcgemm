@@ -1,0 +1,17 @@
+shape,kernel,warps,median_us,dram_read_mb,dram_pct_peak
+decode_up_proj_m1,cublas_gemv,,922.0,117.5,96.9
+decode_up_proj_m1,k13_fp4,4,285.9,33.2,88.6
+decode_up_proj_m1,k13_fp4,8,282.0,33.2,89.8
+decode_up_proj_m1,k10_to_half,,2.9,0.1,15.8
+decode_up_proj_m1,k11_splitk_fp16,,936.0,117.7,95.8
+decode_up_proj_m16,cublas_cutlass_kernel,,1010.1,118.7,90.6
+decode_up_proj_m16,cublasLt_splitKreduce,,18.7,1.8,80.3
+decode_up_proj_m16,k13_fp4,4,311.5,35.2,90.1
+decode_up_proj_m16,k13_fp4,8,309.2,35.2,90.8
+decode_up_proj_m16,k10_to_half,,9.7,0.9,72.7
+decode_up_proj_m16,k11_splitk_fp16,,1060.5,125.0,95.1
+decode_down_proj_m16,ampere_fp16_s16816gemm,,1077.2,119.3,84.3
+decode_down_proj_m16,k13_fp4,4,340.5,34.7,78.7
+decode_down_proj_m16,k13_fp4,8,337.2,34.7,79.4
+decode_down_proj_m16,k10_to_half,,4.5,0.3,45.2
+decode_down_proj_m16,k11_splitk_fp16,,970.0,120.7,95.3

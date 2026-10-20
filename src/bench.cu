@@ -374,14 +374,30 @@ static void backward_bench(void* flush, size_t flush_bytes) {
                 if (!(d <= 0.05 + 1e-2 * std::fabs(r))) ++bad;
                 max_err = std::max(max_err, std::isnan(d) ? INFINITY : d);
             }
+            // Independent fp64 host reference on 512 sampled outputs, so agreement with
+            // cuBLAS cannot hide an error both share.
+            double f64_ours = 0, f64_blas = 0;
+            std::mt19937 pick(7);
+            for (int s = 0; s < 512; ++s) {
+                int i = pick() % g.m, j = pick() % g.n;
+                double acc = 0;
+                for (int t = 0; t < g.k; ++t)
+                    acc += g.name[1] == 'X'
+                        ? (double)__half2float(hdY[(size_t)i * N + t]) * __half2float(hW[(size_t)t * Kf + j])
+                        : (double)__half2float(hdY[(size_t)t * N + i]) * __half2float(hX[(size_t)t * Kf + j]);
+                size_t o = (size_t)i * g.n + j;
+                f64_ours = std::max(f64_ours, std::fabs(__half2float(ho[o]) - acc));
+                f64_blas = std::max(f64_blas, std::fabs(__half2float(hr[o]) - acc));
+            }
             for (int w = 0; w < 3; ++w) { g.blas(ref); g.ours(out); }
             float tb = time_ms([&] { g.blas(ref); }, flush, flush_bytes, 15);
             float to = time_ms([&] { g.ours(out); }, flush, flush_bytes, 15);
             double fl = 2.0 * g.m * g.n * g.k;
             printf("{\"mode\":\"backward\",\"gemm\":\"%s\",\"layer\":\"%s\",\"M\":%d,\"N\":%d,\"K\":%d,\"cublas_tflops\":%.3f,"
-                   "\"ours_tflops\":%.3f,\"pct_cublas\":%.1f,\"max_abs_err\":%.4g,\"bad\":%zu,\"correct\":%s}\n",
-                   g.name, L_.name, g.m, g.n, g.k, fl / tb / 1e9, fl / to / 1e9, 100.0 * tb / to, max_err, bad,
-                   bad == 0 ? "true" : "false");
+                   "\"ours_tflops\":%.3f,\"pct_cublas\":%.1f,\"max_abs_err\":%.4g,\"fp64_err_ours\":%.4g,"
+                   "\"fp64_err_cublas\":%.4g,\"bad\":%zu,\"correct\":%s}\n",
+                   g.name, L_.name, g.m, g.n, g.k, fl / tb / 1e9, fl / to / 1e9, 100.0 * tb / to, max_err, f64_ours,
+                   f64_blas, bad, bad == 0 ? "true" : "false");
             fflush(stdout);
         }
         CK(cudaFree(X)); CK(cudaFree(W)); CK(cudaFree(dY)); CK(cudaFree(out)); CK(cudaFree(ref));

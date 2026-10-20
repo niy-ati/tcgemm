@@ -1,0 +1,6 @@
+{"mode":"backward","gemm":"dX","layer":"llama8b_o_proj_t2048","M":2048,"N":4096,"K":4096,"cublas_tflops":11.598,"ours_tflops":15.142,"pct_cublas":130.6,"max_abs_err":0,"bad":0,"correct":true}
+{"mode":"backward","gemm":"dW","layer":"llama8b_o_proj_t2048","M":4096,"N":4096,"K":2048,"cublas_tflops":16.179,"ours_tflops":14.045,"pct_cublas":86.8,"max_abs_err":0,"bad":0,"correct":true}
+{"mode":"backward","gemm":"dX","layer":"llama8b_up_proj_t2048","M":2048,"N":4096,"K":14336,"cublas_tflops":16.065,"ours_tflops":13.307,"pct_cublas":82.8,"max_abs_err":0,"bad":0,"correct":true}
+{"mode":"backward","gemm":"dW","layer":"llama8b_up_proj_t2048","M":14336,"N":4096,"K":2048,"cublas_tflops":15.735,"ours_tflops":12.217,"pct_cublas":77.6,"max_abs_err":0,"bad":0,"correct":true}
+{"mode":"backward","gemm":"dX","layer":"llama8b_down_proj_t2048","M":2048,"N":14336,"K":4096,"cublas_tflops":16.414,"ours_tflops":10.734,"pct_cublas":65.4,"max_abs_err":0,"bad":0,"correct":true}
+{"mode":"backward","gemm":"dW","layer":"llama8b_down_proj_t2048","M":4096,"N":14336,"K":2048,"cublas_tflops":15.670,"ours_tflops":12.036,"pct_cublas":76.8,"max_abs_err":0,"bad":0,"correct":true}
