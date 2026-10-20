@@ -14,13 +14,14 @@ Layout is `nn.Linear`: `C[M,N] = A[M,K] · W[N,K]^T`, fp16 in, fp32 accumulate, 
 |---|---|---|
 | Prefill, Llama-3-8B projections at 2048 tokens + 4096^3 | **14.2-14.6 TFLOPS, 86-92%** | cuBLASLt, fastest of up to 16 algorithms, each timed |
 | Decode, M = 1-16 | **90-102%** of the better of cuBLAS / cuBLASLt (108-126 GB/s) | same |
-| Decode with FP4 (E2M1) weights | **2.72-2.85x faster** than cuBLAS fp16, 3.3-3.5x fewer DRAM bytes | cuBLAS fp16, Nsight Compute, locked clocks |
-| Backward pass dX, dW | correct on all 6 GEMMs of 3 Llama layers; timing pending | cuBLAS |
-| Fused bias + SiLU + residual epilogue | correct; timing pending | cuBLAS + 1 or 3 elementwise kernels |
+| Decode with FP4 (E2M1) weights | **3.15-3.24x faster** than cuBLAS fp16 for 3.3-3.5x fewer DRAM bytes; 2.4-3.25x timed end to end | cuBLAS fp16 |
+| Backward pass dX, dW | **65-111%**, one untuned kernel; checked against an fp64 host reference | cuBLAS |
+| Fused bias + SiLU + residual epilogue | 1.03-1.11x as one elementwise kernel; **slower** fused into the GEMM on large N (see below) | cuBLAS + 3 elementwise kernels |
 
 Full tables: [`results/summary.md`](results/summary.md). Profiles:
 [`results/ncu_square_4096.md`](results/ncu_square_4096.md),
-[`results/ncu_fp4_decode.md`](results/ncu_fp4_decode.md).
+[`results/ncu_fp4_decode.md`](results/ncu_fp4_decode.md),
+[`results/ncu_epilogue.md`](results/ncu_epilogue.md).
 
 ## The kernels, and what each measurement showed
 
@@ -37,9 +38,9 @@ Full tables: [`results/summary.md`](results/summary.md). Profiles:
 | v10 | split-K decode: M padded to 16 inside the mma tile by `cp.async` zero-fill, fp32 atomics | 90-102 GB/s |
 | v11 | BK 32 -> 64: each W row read as one 128-byte segment | **+15-35%** on every decode shape; burst length mattered more than split-K |
 | v12 | any-layout GEMM via `ldmatrix.trans` | dX = dY·W and dW = dY^T·X with no transpose in memory |
-| v13 | FP4 E2M1 weights, group-32 fp16 scales, dequantized in registers | DRAM bytes / 3.5, time / 2.75 |
+| v13 | FP4 E2M1 weights, group-32 fp16 scales, dequantized in registers | DRAM bytes / 3.3-3.5, kernel time / 3.15-3.24 |
 
-Three things the profiler taught that intuition got wrong:
+Four things the profiler taught that intuition got wrong:
 
 1. **Fixing the bottleneck you can see is not a speed-up.** The swizzle removed 99.99% of bank
    conflicts and the kernel got no faster, because it was DRAM-bound. The win came from
@@ -48,6 +49,9 @@ Three things the profiler taught that intuition got wrong:
    A 112 times; a 128 x 256 tile halves that, and the kernel went from 60% to 86% of cuBLAS.
 3. **For decode, burst length beats parallelism.** Split-K was the obvious fix; the measured fix
    was reading 128 contiguous bytes per W row instead of 64.
+4. **Fusion can add memory traffic.** Moving bias + SiLU + residual into the v9 epilogue made
+   up_proj 11% slower: no spills, but 0.45-0.6 GB more DRAM reads per call, about 8x the residual
+   itself, most likely because the residual loads evict the A/W tiles rasterization reuses from L2.
 
 ## FP4 on a GPU without FP4 tensor cores
 
@@ -59,9 +63,10 @@ so one `__hmul2` by `scale · 2^14` finishes the dequantization, straight into t
 fragment.
 
 Correctness is checked against cuBLAS run on the dequantized weights, which isolates the kernel
-(max abs error <= 0.004) from quantization error (about 10% relative on Gaussian weights, reported
-separately). Nsight Compute shows the remaining gap to the 3.5x byte ratio: v13 drives DRAM at 70-80%
-of peak against cuBLAS's 86-97%, because its 80 KB of pipeline stages allow one 4-warp block per SM.
+(max abs error <= 0.008) from quantization error (about 10% relative on Gaussian weights, reported
+separately). On up_proj v13 drives DRAM at 89-91% of peak, as cuBLAS does, so nearly all of the
+byte saving becomes time; down_proj trails at 79% vs 84%. Doubling the block to 8 warps doubles
+occupancy and gains only ~1%, so that gap is not latency hiding.
 
 ## Methodology
 
@@ -73,7 +78,8 @@ of peak against cuBLAS's 86-97%, because its 80 KB of pipeline stages allow one 
 - **Clocks:** `nvidia-smi` sampled every 500 ms alongside every sweep (`results/*.clocks.csv`).
   Runs on battery are discarded. The power cap there slows cuBLAS more than these kernels and
   overstated percentages by up to 25 points.
-- **Profiles:** Nsight Compute with its default clock lock, so kernels are compared at the same clock.
+- **Profiles:** Nsight Compute with its default clock lock, so kernels are compared at the same clock,
+  and also on AC only: the lock fixes the SM clock, but on battery DRAM bandwidth was still limited.
 
 ## Build and run
 
